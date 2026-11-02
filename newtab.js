@@ -745,10 +745,10 @@ function createFavicon(tab) {
   const url = tab.url || '';
 
   let src = '';
-  if (/^(https?|file):/i.test(url)) {
-    src = `${chrome.runtime.getURL('_favicon/')}?pageUrl=${encodeURIComponent(url)}&size=32`;
-  } else if (tab.favIconUrl && /^data:/i.test(tab.favIconUrl)) {
+  if (tab.favIconUrl && /^data:/i.test(tab.favIconUrl)) {
     src = tab.favIconUrl;
+  } else if (/^(https?|file):/i.test(url)) {
+    src = `${chrome.runtime.getURL('_favicon/')}?pageUrl=${encodeURIComponent(url)}&size=32`;
   }
 
   if (!src) {
@@ -1001,7 +1001,7 @@ function displayUrl(url) {
     if (parsed.protocol === 'file:') {
       return parsed.pathname.split('/').filter(Boolean).pop() || 'file';
     }
-    if (parsed.protocol === 'chrome:' || parsed.protocol === 'chrome-extension:' || parsed.protocol === 'about:') {
+    if (parsed.protocol === 'chrome:' || parsed.protocol === 'chrome-extension:' || parsed.protocol === 'moz-extension:' || parsed.protocol === 'about:') {
       return url.replace(/\/$/, '');
     }
     return parsed.hostname || url;

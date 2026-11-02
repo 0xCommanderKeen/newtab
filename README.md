@@ -1,7 +1,7 @@
 # Tab Overview
 
-A Chrome/Brave extension that replaces the new tab page with an overview of every
-open tab, tab group, and window. Everything runs locally.
+A Chrome, Brave, and Firefox extension that replaces the new tab page with an
+overview of every open tab, tab group, and window. Everything runs locally.
 
 ![Tab Overview window view](screenshot.png)
 
@@ -9,8 +9,8 @@ open tab, tab group, and window. Everything runs locally.
 
 ## Is this feasible?
 
-Yes. Chrome has supported new tab page overrides for years, and Manifest V3 exposes
-everything this needs:
+Yes. Chrome and Firefox have supported new tab page overrides for years, and
+Manifest V3 exposes everything this needs:
 
 | What | API |
 | --- | --- |
@@ -18,12 +18,20 @@ everything this needs:
 | Read tabs, titles, URLs, windows | `chrome.tabs` + `chrome.windows` (`"tabs"` permission) |
 | Read tab groups and colors | `chrome.tabGroups` (`"tabGroups"` permission) |
 | Track when tabs were opened | `chrome.tabs.onCreated` + `chrome.storage.session` (`"storage"` permission) |
-| Local favicons | `chrome-extension://<id>/_favicon/` (`"favicon"` permission) |
+| Local favicons | `chrome-extension://<id>/_favicon/` (`"favicon"` permission) in Chrome, the tab's `data:` favicon in Firefox |
 
 No host permissions and no network access are required. Brave, Edge, and other
 Chromium browsers support the same manifest and APIs.
 
+One `manifest.json` serves Chrome and Firefox. The `background` key lists both
+`service_worker` and `scripts`: Chrome uses the service worker and ignores
+`scripts`, and Firefox runs `background.js` as a background script. The
+`browser_specific_settings.gecko` block gives Firefox the extension ID it
+requires for Manifest V3.
+
 ## Install
+
+### Chrome and Brave
 
 1. Open `chrome://extensions` (or `brave://extensions`).
 2. Turn on **Developer mode**.
@@ -31,6 +39,23 @@ Chromium browsers support the same manifest and APIs.
 4. Open a new tab.
 
 If you later change the files, click the reload button on the extension card.
+
+### Firefox
+
+1. Open `about:debugging#/runtime/this-firefox`.
+2. Click **Load Temporary Add-on…** and choose `manifest.json` in this folder.
+3. Open a new tab.
+
+Firefox removes temporary add-ons when it restarts. A permanent install needs a
+signed build, either listed on addons.mozilla.org (AMO) or signed for unlisted
+self-distribution with `web-ext sign`. To check and package the extension:
+
+```
+npx web-ext lint
+npx web-ext build --ignore-files "screenshot*.png"
+```
+
+The package is written to `web-ext-artifacts/`.
 
 ## Features
 
@@ -72,7 +97,9 @@ The rules live in `categories.js`, so you can add domains or keywords there.
   stores or transmits that data.
 - `tabGroups` — read tab group titles, colors, and membership.
 - `favicon` — load favicons from Chrome's local favicon cache. No favicon
-  requests are made to websites.
+  requests are made to websites. This permission is Chrome-only. Firefox ignores
+  it with a warning, and the page uses the `data:` favicon Firefox already
+  provides for each tab, so Firefox makes no favicon requests to websites either.
 - `storage` — keep tab open timestamps in session storage. This data is cleared
   when the browser exits and never leaves the machine.
 
@@ -98,11 +125,14 @@ is visible.
   `categories.js` to tune the domain and keyword rules.
 - A browser restart restores the tab group state from Chrome's session; the
   overview's local group-collapse choices are stored in `localStorage`.
+- Firefox 140 or newer is required. Tab groups use Firefox's tab groups feature,
+  which shipped in Firefox 139.
+- Pages without a favicon show a letter badge in both browsers.
 
 ## Files
 
 ```
-manifest.json     Manifest V3 definition, new tab override, and background worker
+manifest.json     Manifest V3 definition for Chrome and Firefox, new tab override, and background worker
 background.js     Records tab open times and cleans them up
 categories.js     Domain and keyword rules for the sorted view
 newtab.html       Page shell
