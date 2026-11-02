@@ -79,6 +79,7 @@ const state = {
 };
 
 const els = {};
+const iconTemplates = new Map();
 let refreshTimer = null;
 
 /* ------------------------------------------------------------------ startup */
@@ -460,7 +461,7 @@ function renderCategory({ meta, tabs }, query) {
   header.setAttribute('aria-label', `${meta.label}, ${plural(tabs.length, 'tab')}`);
 
   const chevron = el('span', 'group-chevron');
-  chevron.innerHTML = ICONS.chevron;
+  chevron.append(createIcon(ICONS.chevron));
 
   const dot = el('span', 'group-dot');
   const name = el('span', 'group-name');
@@ -606,7 +607,7 @@ function renderGroup(group) {
   );
 
   const chevron = el('span', 'group-chevron');
-  chevron.innerHTML = ICONS.chevron;
+  chevron.append(createIcon(ICONS.chevron));
 
   const dot = el('span', 'group-dot');
   const name = el('span', 'group-name');
@@ -726,7 +727,7 @@ function renderTab(tab, options = {}) {
   close.type = 'button';
   close.className = 'tab-close';
   close.setAttribute('aria-label', `Close ${titleText}`);
-  close.innerHTML = ICONS.close;
+  close.append(createIcon(ICONS.close));
   close.addEventListener('click', () => closeTab(tab));
 
   card.append(main, close);
@@ -783,7 +784,7 @@ function fallbackFavicon(tab) {
 
 function createFlag(svg, label) {
   const span = el('span', 'tab-flag');
-  span.innerHTML = svg;
+  span.append(createIcon(svg));
   span.setAttribute('role', 'img');
   span.setAttribute('aria-label', label);
   span.title = label;
@@ -794,7 +795,7 @@ function createEmptyState({ icon, title, message, actionLabel, onAction }) {
   const wrap = el('div', 'empty');
 
   const iconEl = el('div', 'empty-icon');
-  iconEl.innerHTML = icon;
+  iconEl.append(createIcon(icon));
 
   const heading = document.createElement('h2');
   heading.textContent = title;
@@ -1036,6 +1037,16 @@ function el(tag, className) {
   const node = document.createElement(tag);
   if (className) node.className = className;
   return node;
+}
+
+function createIcon(markup) {
+  let template = iconTemplates.get(markup);
+  if (!template) {
+    // text/html, not image/svg+xml: the HTML parser namespaces <svg> without an xmlns attribute.
+    template = new DOMParser().parseFromString(markup, 'text/html').body.firstElementChild;
+    iconTemplates.set(markup, template);
+  }
+  return template.cloneNode(true);
 }
 
 if (document.readyState === 'loading') {
