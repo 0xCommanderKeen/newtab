@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>New Tab</title>
+    <link rel="stylesheet" href="newtab.css">
+  </head>
+  <body>
+    <div class="app">
+      <header class="topbar">
+        <div class="topbar-inner">
+          <div class="brand">
+            <img class="brand-mark" src="icons/icon48.png" alt="" width="38" height="38">
+            <div class="brand-text">
+              <h1>Tab Overview</h1>
+              <p class="summary" id="summary" aria-live="polite">Reading your tabs…</p>
+            </div>
+          </div>
+
+          <div class="view-switch" role="group" aria-label="View">
+            <button type="button" class="view-button is-active" data-view="windows" aria-pressed="true">Windows</button>
+            <button type="button" class="view-button" data-view="sorted" aria-pressed="false">Sorted</button>
+          </div>
+
+          <div class="search">
+            <svg class="search-icon" viewBox="0 0 20 20" fill="none" aria-hidden="true">
+              <circle cx="9" cy="9" r="5.5" stroke="currentColor" stroke-width="1.6"/>
+              <path d="m13.2 13.2 3.3 3.3" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
+            </svg>
+            <input
+              id="search"
+              type="search"
+              placeholder="Search tabs"
+              autocomplete="off"
+              spellcheck="false"
+              aria-label="Search tabs"
+            >
+            <kbd aria-hidden="true">/</kbd>
+          </div>
+        </div>
+      </header>
+
+      <main class="overview" id="overview"></main>
+
+      <footer class="footer">
+        <span>Click a tab to switch to it · Press <kbd>/</kbd> to search</span>
+        <span>Everything stays in your browser. No data leaves this page.</span>
+      </footer>
+    </div>
+
+    <script type="module" src="newtab.js"></script>
+  </body>
+</html>
