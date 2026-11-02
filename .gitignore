@@ -26,6 +26,7 @@ dist/
 build/
 *.crx
 *.pem
+web-ext-artifacts/
 
 # Local environment files
 .env
