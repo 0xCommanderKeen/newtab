@@ -101,6 +101,10 @@ const ICONS = {
     '<svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">' +
     '<circle cx="3.5" cy="8" r="1.3"/><circle cx="8" cy="8" r="1.3"/>' +
     '<circle cx="12.5" cy="8" r="1.3"/></svg>',
+  pencil:
+    '<svg viewBox="0 0 16 16" fill="none" aria-hidden="true">' +
+    '<path d="M10.5 3.5l2 2L6 12l-2.6.6L4 10z" stroke="currentColor" stroke-width="1.5" ' +
+    'stroke-linejoin="round"/></svg>',
 };
 
 const SOURCES = {
@@ -179,8 +183,6 @@ const state = {
   groupRules: compileCustomGroups([]),
   // null | { key, host, naming, draft }: the open tab card menu
   menu: null,
-  panelOpen: false,
-  confirmDeleteGroupId: null,
   loading: true,
 };
 
@@ -206,8 +208,7 @@ function init() {
   els.archiveImportFile = document.getElementById('archive-import-file');
   els.banner = document.getElementById('banner');
   els.footerHint = document.getElementById('footer-hint');
-  els.groupsOpen = document.getElementById('groups-open');
-  els.groupsPanel = document.getElementById('groups-panel');
+  els.groupsAdd = document.getElementById('groups-add');
 
   if (!globalThis.chrome?.tabs?.query || !globalThis.chrome?.windows?.getAll) {
     renderUnsupported();
@@ -254,13 +255,7 @@ async function refresh(parts = Object.keys(LOADERS)) {
   if (isBusy()) return;
   await Promise.all(parts.map((part) => LOADERS[part]()));
   state.loading = false;
-  if (pointerHeld()) {
-    renderDeferred = true;
-    clearTimeout(refreshTimer);
-    refreshTimer = setTimeout(flushRefresh, 100);
-    return;
-  }
-  render();
+  renderWhenReleased();
 }
 
 function scheduleRefresh(part) {
@@ -279,6 +274,16 @@ let pointerDownAt = 0;
 let renderDeferred = false;
 
 const pointerHeld = () => pointerDownAt !== 0 && Date.now() - pointerDownAt < 2000;
+
+function renderWhenReleased() {
+  if (pointerHeld()) {
+    renderDeferred = true;
+    clearTimeout(refreshTimer);
+    refreshTimer = setTimeout(flushRefresh, 100);
+    return;
+  }
+  render();
+}
 
 function flushRefresh() {
   if (pointerHeld()) {
@@ -493,6 +498,8 @@ function bindEvents() {
 function bindSearch() {
   els.search.addEventListener('input', () => {
     state.query = els.search.value;
+    // A search hides groups without matching tabs, so it would hide the editor of one.
+    if (state.query.trim()) closeGroupEditor();
     render();
   });
 
@@ -521,15 +528,15 @@ function bindSearch() {
       return;
     }
 
-    if (event.key === 'Escape' && state.confirmDeleteGroupId) {
+    if (event.key === 'Escape' && openEditor?.confirmingDelete) {
       event.preventDefault();
       cancelGroupDelete();
       return;
     }
 
-    if (event.key === 'Escape' && state.panelOpen) {
+    if (event.key === 'Escape' && openEditor) {
       event.preventDefault();
-      closeGroupsPanel();
+      closeGroupEditor({ focusButton: true });
       return;
     }
 
@@ -648,7 +655,6 @@ function render() {
   const ctx = sourceContext(state.source);
   renderControls();
   renderBanner();
-  renderGroupsPanel();
 
   if (state.loading) {
     els.summary.textContent = 'Reading your tabs…';
@@ -656,11 +662,40 @@ function render() {
     return;
   }
 
-  els.overview.replaceChildren();
+  clearOverview();
   renderSource(ctx);
+  finishOverview();
   // The menu's tab closed or left this view.
   if (state.menu && !els.overview.querySelector('.tab-menu')) state.menu = null;
   restoreFocus(focus);
+}
+
+// The open group editor's section stays in the page across renders, and the
+// rest of the overview is rebuilt around it. Moving or rebuilding it would
+// drop focus and the field being typed in, and the button under a click that
+// started a save.
+let mountBefore = null;
+
+function clearOverview() {
+  const kept = openEditor?.section.parentNode === els.overview ? openEditor.section : null;
+  for (const child of [...els.overview.children]) {
+    if (child !== kept) child.remove();
+  }
+  mountBefore = kept;
+}
+
+function mount(node) {
+  if (node === mountBefore) {
+    mountBefore = null;
+    return;
+  }
+  els.overview.insertBefore(node, mountBefore);
+}
+
+function finishOverview() {
+  mountBefore?.remove();
+  mountBefore = null;
+  if (openEditor && !openEditor.section.isConnected) openEditor = null;
 }
 
 function sourceContext(source) {
@@ -683,8 +718,10 @@ function renderSource(ctx) {
   const totalTabs = windows.reduce((sum, win) => sum + win.tabs.length, 0);
 
   if (totalTabs === 0) {
-    els.overview.append(createEmptyState(ctx.empty));
+    mount(createEmptyState(ctx.empty));
     els.summary.textContent = plural(0, ctx.tabNoun);
+    // Custom groups stay listed so they can still be made and edited.
+    if (state.view === 'sorted' && !ctx.query) renderSortedView(windows, ctx);
     return;
   }
 
@@ -717,6 +754,8 @@ function renderControls() {
     ? 'No tabs to archive'
     : `Save ${plural(count, 'tab')} to the archive and close them`;
 
+  els.groupsAdd.hidden = state.view !== 'sorted';
+  els.groupsAdd.disabled = busy;
   els.archiveExport.hidden = state.source !== 'archive';
   els.archiveImport.hidden = state.source !== 'archive';
   els.archiveExport.disabled = busy || (archived === 0 && state.customGroups.length === 0);
@@ -865,7 +904,7 @@ function renderBatchesView(ctx) {
     if (count === 0) continue;
     matched += count;
     groups += countGroups(batch.windows);
-    els.overview.append(renderBatch(batch, sections, count, ctx));
+    mount(renderBatch(batch, sections, count, ctx));
   }
 
   return { matched, detail: plural(groups, 'group') };
@@ -922,7 +961,7 @@ function cancelBatchDelete(batchId) {
 function renderWindowView(ctx) {
   const { sections, matched } = filterWindows(state.windows, ctx.query);
   for (const section of sections) {
-    els.overview.append(renderWindow(section, ctx));
+    mount(renderWindow(section, ctx));
   }
   return { matched, detail: plural(countGroups(state.windows), 'group') };
 }
@@ -945,16 +984,16 @@ function filterWindows(windows, query) {
 function renderSortedView(windows, ctx) {
   const categories = buildCategories(windows, ctx.query);
   for (const bucket of categories) {
-    els.overview.append(renderCategory(bucket, ctx));
+    mount(renderCategory(bucket, ctx));
   }
   return {
     matched: categories.reduce((sum, bucket) => sum + bucket.tabs.length, 0),
-    detail: plural(categories.length, 'category', 'categories'),
+    detail: plural(categories.filter((bucket) => bucket.tabs.length > 0).length, 'category', 'categories'),
   };
 }
 
 function renderEmptySearch(totalTabs, ctx) {
-  els.overview.append(createEmptyState({
+  mount(createEmptyState({
     icon: ICONS.search,
     title: `No ${ctx.tabNoun}s match “${state.query.trim()}”`,
     message: 'Try a shorter search, or search by site address.',
@@ -996,22 +1035,19 @@ function restoreFocus(key) {
   if (target && target !== document.activeElement) target.focus({ preventScroll: true });
 }
 
+const emptyBucket = (meta) => ({ meta, tabs: [], archivable: 0, windows: new Set() });
+
 function buildCategories(windows, query) {
-  const buckets = new Map();
+  // Without a search, every custom group gets a section, so a group with no
+  // tabs yet can be found and edited.
+  const buckets = new Map(query ? [] : state.groupRules.categories.map((meta) => [meta.id, emptyBucket(meta)]));
 
   for (const win of windows) {
     const groupTitles = new Map(win.groups.map((group) => [group.id, group.title]));
 
     for (const tab of win.tabs) {
       const category = categorizeTab(tab, state.groupRules);
-      if (!buckets.has(category.id)) {
-        buckets.set(category.id, {
-          meta: category,
-          tabs: [],
-          archivable: 0,
-          windows: new Set(),
-        });
-      }
+      if (!buckets.has(category.id)) buckets.set(category.id, emptyBucket(category));
       const bucket = buckets.get(category.id);
       // A section archive takes the whole category, matched by search or not.
       if (!skipReason(tab)) bucket.archivable += 1;
@@ -1026,7 +1062,7 @@ function buildCategories(windows, query) {
 
   const rank = (meta) => (meta.custom ? meta.order : state.customGroups.length + CATEGORY_INDEX.get(meta.id));
   return [...buckets.values()]
-    .filter((bucket) => bucket.tabs.length > 0)
+    .filter((bucket) => bucket.tabs.length > 0 || (bucket.meta.custom && !query))
     .sort((a, b) => rank(a.meta) - rank(b.meta));
 }
 
@@ -1037,9 +1073,15 @@ function tabMatchesQuery(tab, groupTitle, query) {
 }
 
 function renderCategory({ meta, tabs, archivable }, ctx) {
-  const section = el('section', 'category');
+  const editor = meta.custom && openEditor?.id === meta.groupId ? openEditor : null;
+  const section = editor?.section ?? el('section');
+  for (const child of [...section.children]) {
+    if (child !== editor?.item) child.remove();
+  }
+  section.className = 'category';
   section.dataset.category = meta.custom ? 'custom' : meta.id;
   if (meta.custom) section.dataset.color = meta.color;
+  if (tabs.length === 0) section.classList.add('is-empty');
 
   const isCollapsed = ctx.query === '' && state.collapsedCategories.has(meta.id);
   if (isCollapsed) section.classList.add('is-collapsed');
@@ -1061,29 +1103,49 @@ function renderCategory({ meta, tabs, archivable }, ctx) {
 
   header.append(chevron, dot, name, count);
   header.addEventListener('click', () => toggleCategory(meta.id));
-  section.append(headerRow('categoryId', meta.id, header, sectionArchiveButton(ctx,
-    { kind: 'category', id: meta.id, name: meta.label, label: meta.label },
-    archivable, 'category-archive', `[data-category-id="${CSS.escape(meta.id)}"] .category-archive`)));
+  section.prepend(headerRow('categoryId', meta.id, header,
+    meta.custom && EXTENSION_STORAGE ? editGroupButton(meta) : null,
+    sectionArchiveButton(ctx, { kind: 'category', id: meta.id, name: meta.label, label: meta.label },
+      archivable, 'category-archive', `[data-category-id="${CSS.escape(meta.id)}"] .category-archive`)));
+  if (editor) updateGroupEditor(editor, state.customGroups[meta.order], meta.order);
 
-  if (!isCollapsed) {
-    const grid = el('div', 'group-tabs');
-    for (const { tab, win } of tabs) {
-      grid.append(renderTab(tab, ctx, { windowBadge: win.badge }));
-    }
-    section.append(grid);
+  if (isCollapsed) return section;
+  if (tabs.length === 0) {
+    const note = el('p', 'category-empty');
+    note.textContent = 'No tabs yet. Add domains, or use a tab’s ⋯ menu.';
+    section.append(note);
+    return section;
   }
-
+  const grid = el('div', 'group-tabs');
+  for (const { tab, win } of tabs) {
+    grid.append(renderTab(tab, ctx, { windowBadge: win.badge }));
+  }
+  section.append(grid);
   return section;
 }
 
-// The header is a toggle button, so the archive control sits beside it in a
-// row that carries the focus scope for both.
-function headerRow(scopeKey, scopeId, header, archive) {
+// The header is a toggle button, so the section's other controls sit beside
+// it in a row that carries the focus scope for all of them.
+function headerRow(scopeKey, scopeId, header, ...controls) {
   const row = el('div', 'group-header-row');
   row.dataset[scopeKey] = String(scopeId);
-  row.append(header);
-  if (archive) row.append(archive);
+  row.append(header, ...controls.filter(Boolean));
   return row;
+}
+
+function editGroupButton(meta) {
+  const open = openEditor?.id === meta.groupId;
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.className = 'section-edit category-edit';
+  button.title = `Edit ${meta.label}`;
+  button.setAttribute('aria-label', `Edit ${meta.label}`);
+  button.setAttribute('aria-expanded', String(open));
+  button.append(createIcon(ICONS.pencil));
+  button.addEventListener('click', () => (open
+    ? closeGroupEditor({ focusButton: true })
+    : openGroupEditor(meta.groupId)));
+  return button;
 }
 
 function sectionArchiveButton(ctx, scope, count, className, returnFocus) {
@@ -1662,10 +1724,8 @@ function groupableHost(url) {
 }
 
 function bindCustomGroups() {
-  els.groupsOpen.hidden = !EXTENSION_STORAGE;
-  els.groupsPanel.hidden = true;
   if (!EXTENSION_STORAGE) return;
-  els.groupsOpen.addEventListener('click', () => (state.panelOpen ? closeGroupsPanel() : openGroupsPanel()));
+  els.groupsAdd.addEventListener('click', addGroup);
   // mousedown, not click: closing must not rebuild the page under a click
   // that is about to land on another card.
   document.addEventListener('mousedown', (event) => {
@@ -1680,7 +1740,9 @@ async function changeGroups(change) {
     const groups = await change();
     state.customGroups = groups;
     state.groupRules = compileCustomGroups(groups);
-    render();
+    // A save often starts with the mousedown that blurs a field; rendering
+    // before the mouseup would replace the button being clicked.
+    renderWhenReleased();
     return groups;
   } catch (error) {
     console.error('Tab Overview: could not save custom groups', error);
@@ -1827,101 +1889,34 @@ function closeMenu({ focusButton = false } = {}) {
   if (focusButton && tabId !== undefined) document.querySelector(menuButtonSelector(tabId))?.focus();
 }
 
-function openGroupsPanel() {
-  state.panelOpen = true;
+// null | GroupEditor: the one inline editor, in its group's Sorted section.
+// GroupEditor { id, section, item, confirmingDelete, ...its fields and buttons }
+let openEditor = null;
+
+function openGroupEditor(id, { select = false } = {}) {
+  openEditor = createGroupEditor(id);
   render();
-  focusFirst(['#groups-panel .group-edit-label', '#groups-add']);
+  if (!openEditor) return;
+  openEditor.label.focus();
+  if (select) openEditor.label.select();
 }
 
-function closeGroupsPanel() {
-  state.panelOpen = false;
-  state.confirmDeleteGroupId = null;
+function closeGroupEditor({ focusButton = false } = {}) {
+  if (!openEditor) return;
+  const { id, item } = openEditor;
+  // Blurring commits a field that is still being typed in.
+  if (item.contains(document.activeElement)) document.activeElement.blur();
+  openEditor = null;
   render();
-  els.groupsOpen.focus();
-}
-
-// The panel's nodes persist while it is open and are updated in place. A
-// rebuild would remove the field being typed in, which fires its change
-// event early, and the button under a click that started a save.
-const panel = { shell: null, list: null, empty: null, editors: new Map() };
-
-function renderGroupsPanel() {
-  if (!EXTENSION_STORAGE) return;
-  els.groupsOpen.setAttribute('aria-expanded', String(state.panelOpen));
-  els.groupsPanel.hidden = !state.panelOpen;
-  if (!state.panelOpen) {
-    panel.shell = null;
-    panel.editors.clear();
-    els.groupsPanel.replaceChildren();
-    return;
-  }
-
-  if (!panel.shell) buildPanelShell();
-  const busy = isBusy();
-  for (const button of panel.shell.querySelectorAll('.groups-actions .button')) button.disabled = busy;
-
-  const live = new Set(state.customGroups.map((group) => group.id));
-  for (const [id, editor] of panel.editors) {
-    if (live.has(id)) continue;
-    editor.item.remove();
-    panel.editors.delete(id);
-  }
-
-  state.customGroups.forEach((group, index) => {
-    let editor = panel.editors.get(group.id);
-    if (!editor) {
-      editor = createGroupEditor(group.id);
-      panel.editors.set(group.id, editor);
-    }
-    updateGroupEditor(editor, group, index, busy);
-    if (panel.list.children[index] !== editor.item) {
-      panel.list.insertBefore(editor.item, panel.list.children[index] ?? null);
-    }
-  });
-
-  panel.empty.hidden = state.customGroups.length > 0;
-  panel.list.hidden = state.customGroups.length === 0;
-}
-
-function buildPanelShell() {
-  const card = el('div', 'groups-card');
-
-  const head = el('div', 'groups-head');
-  const heading = document.createElement('h2');
-  heading.id = 'groups-title';
-  heading.textContent = 'Custom groups';
-  const actions = el('div', 'groups-actions');
-  const add = createButton('New group', addGroupFromPanel);
-  add.id = 'groups-add';
-  const close = createButton('Close', closeGroupsPanel, 'is-primary');
-  close.id = 'groups-close';
-  actions.append(add, close);
-  head.append(heading, actions);
-
-  const intro = el('p', 'groups-intro');
-  intro.textContent = 'In the Sorted view, tabs from a group’s domains go to that group, ahead of the ' +
-    'built-in categories. A domain also covers its subdomains; add a path, like github.com/your-org, ' +
-    'to match only part of a site. Keywords match whole words in the title or address. ' +
-    'Export and Import on the Archive view include your groups.';
-
-  panel.empty = el('p', 'groups-empty');
-  panel.empty.textContent = 'No custom groups yet. Add one here, or use the ⋯ button on any tab.';
-  panel.list = el('ol', 'groups-list');
-
-  card.append(head, intro, panel.empty, panel.list);
-  panel.shell = card;
-  panel.editors.clear();
-  els.groupsPanel.replaceChildren(card);
+  if (focusButton) focusFirst([`[data-category-id="${CSS.escape(`custom:${id}`)}"] .category-edit`]);
 }
 
 function createGroupEditor(id) {
   const save = (patch) => changeGroups(() => editGroup(id, patch));
-  const item = el('li', 'group-editor');
+  const item = el('div', 'group-editor');
   item.dataset.customGroupId = id;
 
   const head = el('div', 'group-editor-head');
-  const dot = el('span', 'group-dot');
-
   const label = document.createElement('input');
   label.type = 'text';
   label.className = 'group-edit-label';
@@ -1948,38 +1943,42 @@ function createGroupEditor(id) {
   colors.append(...swatches);
 
   const actions = el('div', 'group-editor-actions');
-  const up = createButton('↑', () => moveCustomGroup(id, -1), 'icon-button group-move-up');
-  const down = createButton('↓', () => moveCustomGroup(id, 1), 'icon-button group-move-down');
-  const remove = createButton('Delete', () => {
-    state.confirmDeleteGroupId = id;
+  const up = createButton('Move up', () => moveCustomGroup(id, -1), 'is-ghost group-move-up');
+  const down = createButton('Move down', () => moveCustomGroup(id, 1), 'is-ghost group-move-down');
+  const remove = createButton('Delete group', () => {
+    openEditor.confirmingDelete = true;
     render();
     item.querySelector('.group-delete-cancel').focus();
-  }, 'group-delete');
-  actions.append(up, down, remove);
+  }, 'is-ghost group-delete');
+  const done = createButton('Done', () => closeGroupEditor({ focusButton: true }), 'group-edit-done');
+  actions.append(up, down, remove, done);
 
   const confirm = el('div', 'group-editor-actions group-delete-prompt');
   const question = el('span', 'group-delete-question');
   confirm.append(
     question,
     createButton('Delete', () => {
-      state.confirmDeleteGroupId = null;
+      openEditor.confirmingDelete = false;
       changeGroups(() => deleteGroup(id)).then(() => focusFirst(['#groups-add']));
     }, 'is-danger group-delete-confirm'),
     createButton('Cancel', cancelGroupDelete, 'group-delete-cancel'),
   );
 
-  head.append(dot, label, colors, actions, confirm);
+  head.append(label, colors, actions, confirm);
 
-  const domains = listField('Domains', 'group-edit-domains', 'example.com\ngithub.com/your-org',
+  const domains = listField('Domains · one per line', 'group-edit-domains', 'example.com\ngithub.com/your-org',
     (lines) => save({ domains: lines }));
-  const keywords = listField('Keywords', 'group-edit-keywords', 'invoice\nquarterly report',
+  const keywords = listField('Keywords · optional', 'group-edit-keywords', 'invoice\nquarterly report',
     (lines) => save({ keywords: lines }));
   const fields = el('div', 'group-editor-fields');
   fields.append(domains.wrap, keywords.wrap);
 
   item.append(head, fields);
+  const section = el('section');
+  section.append(item);
   return {
-    item, label, swatches, up, down, remove, actions, confirm, question,
+    id, section, item, confirmingDelete: false,
+    label, swatches, up, down, remove, actions, confirm, question,
     domains: domains.area, keywords: keywords.area,
   };
 }
@@ -1989,7 +1988,8 @@ function setFieldValue(field, value) {
   if (field !== document.activeElement && field.value !== value) field.value = value;
 }
 
-function updateGroupEditor(editor, group, index, busy) {
+function updateGroupEditor(editor, group, index) {
+  const busy = isBusy();
   editor.item.dataset.color = group.color;
   setFieldValue(editor.label, group.label);
   setFieldValue(editor.domains, group.domains.join('\n'));
@@ -2006,9 +2006,8 @@ function updateGroupEditor(editor, group, index, busy) {
   editor.up.setAttribute('aria-label', `Move ${group.label} up`);
   editor.down.setAttribute('aria-label', `Move ${group.label} down`);
 
-  const confirming = state.confirmDeleteGroupId === group.id;
-  editor.actions.hidden = confirming;
-  editor.confirm.hidden = !confirming;
+  editor.actions.hidden = editor.confirmingDelete;
+  editor.confirm.hidden = !editor.confirmingDelete;
   editor.question.textContent = `Delete ${group.label}?`;
   for (const button of editor.confirm.querySelectorAll('button')) button.disabled = busy;
 }
@@ -2016,7 +2015,7 @@ function updateGroupEditor(editor, group, index, busy) {
 function listField(title, className, placeholder, save) {
   const wrap = el('label', 'group-field');
   const name = el('span', 'group-field-name');
-  name.textContent = `${title} · one per line`;
+  name.textContent = title;
   const area = document.createElement('textarea');
   area.className = className;
   area.spellcheck = false;
@@ -2026,19 +2025,24 @@ function listField(title, className, placeholder, save) {
   return { wrap, area };
 }
 
-async function addGroupFromPanel() {
+async function addGroup() {
+  if (isBusy()) return;
+  // A search hides groups without tabs, and the new group has none yet.
+  if (state.query) {
+    state.query = '';
+    els.search.value = '';
+  }
   const groups = await changeGroups(() => createGroup({ label: 'New group' }));
   const created = groups?.at(-1);
-  if (!created) return;
-  const input = document.querySelector(`[data-custom-group-id="${CSS.escape(created.id)}"] .group-edit-label`);
-  input?.focus();
-  input?.select();
+  if (created) openGroupEditor(created.id, { select: true });
 }
 
 async function moveCustomGroup(id, offset) {
   await changeGroups(() => moveGroup(id, offset));
   const editor = `[data-custom-group-id="${CSS.escape(id)}"]`;
-  if (document.activeElement === document.body || !els.groupsPanel.contains(document.activeElement)) {
+  // The button just pressed is disabled once the group reaches the end of the list.
+  const active = document.activeElement;
+  if (!openEditor?.item.contains(active) || active.disabled) {
     focusFirst([
       `${editor} ${offset < 0 ? '.group-move-up' : '.group-move-down'}:not(:disabled)`,
       `${editor} .group-move-up:not(:disabled)`,
@@ -2048,10 +2052,10 @@ async function moveCustomGroup(id, offset) {
 }
 
 function cancelGroupDelete() {
-  const id = state.confirmDeleteGroupId;
-  state.confirmDeleteGroupId = null;
+  if (!openEditor) return;
+  openEditor.confirmingDelete = false;
   render();
-  focusFirst([`[data-custom-group-id="${CSS.escape(id)}"] .group-delete`, '#groups-add']);
+  openEditor?.remove.focus();
 }
 
 function toggleGroup(ctx, groupId) {

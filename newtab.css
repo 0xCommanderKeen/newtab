@@ -467,6 +467,17 @@ textarea {
   gap: 6px;
 }
 
+.category.is-empty {
+  padding-bottom: 14px;
+}
+
+.category-empty {
+  margin: 0;
+  padding: 0 8px;
+  color: var(--text-3);
+  font-size: 12.5px;
+}
+
 .category .group-name {
   font-size: 14px;
   font-weight: 650;
@@ -845,7 +856,8 @@ textarea {
   transform: rotate(-90deg);
 }
 
-.section-archive {
+.section-archive,
+.section-edit {
   display: grid;
   place-items: center;
   flex: none;
@@ -857,14 +869,33 @@ textarea {
   background: transparent;
   color: var(--text-3);
   cursor: pointer;
-  opacity: 0;
   transition: opacity 0.12s ease, background-color 0.12s ease, color 0.12s ease;
 }
 
-.section-archive svg {
+.section-archive {
+  opacity: 0;
+}
+
+.section-archive svg,
+.section-edit svg {
   display: block;
   width: 16px;
   height: 16px;
+}
+
+.section-edit:hover {
+  background: var(--bg-soft);
+  color: var(--text);
+}
+
+.section-edit[aria-expanded="true"] {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.section-edit:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -1px;
 }
 
 .group-header-row:hover .section-archive,
@@ -1282,74 +1313,18 @@ textarea {
   font-weight: 600;
 }
 
-/* ------------------------------------------------------------ groups panel */
-
-.groups-panel {
-  max-width: 1240px;
-  margin: 0 auto;
-  padding: 20px 28px 0;
-}
-
-.groups-panel[hidden],
-.groups-panel [hidden] {
-  display: none;
-}
-
-.groups-card {
-  padding: 18px 20px 20px;
-  border: 1px solid var(--accent-border);
-  border-radius: var(--radius);
-  background: var(--bg-elev);
-  box-shadow: var(--shadow);
-}
-
-.groups-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-}
-
-.groups-head h2 {
-  margin: 0;
-  font-size: 15px;
-  font-weight: 650;
-  letter-spacing: -0.01em;
-}
-
-.groups-actions {
-  display: flex;
-  gap: 8px;
-}
-
-.groups-intro,
-.groups-empty {
-  max-width: 760px;
-  margin: 6px 0 0;
-  color: var(--text-2);
-  font-size: 12.5px;
-}
-
-.groups-empty {
-  margin-top: 14px;
-  color: var(--text-3);
-}
-
-.groups-list {
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-  margin: 16px 0 0;
-  padding: 0;
-  list-style: none;
-}
+/* ------------------------------------------------------------ group editor */
 
 .group-editor {
-  padding: 12px 14px 14px;
-  border: 1px solid var(--border);
-  border-left: 3px solid var(--group-color, var(--border));
+  margin: 4px 0 8px;
+  padding: 12px;
+  border: 1px dashed var(--border-strong);
   border-radius: 12px;
-  background: var(--bg);
+  background: var(--bg-soft);
+}
+
+.group-editor [hidden] {
+  display: none;
 }
 
 .group-editor-head {
@@ -1409,9 +1384,16 @@ textarea {
   margin-left: auto;
 }
 
-.button.icon-button {
-  min-width: 30px;
-  padding: 6px 8px;
+.button.is-ghost {
+  border-color: transparent;
+  background: transparent;
+  color: var(--text-2);
+}
+
+.button.is-ghost:hover:not(:disabled) {
+  border-color: transparent;
+  background: var(--bg-elev);
+  color: var(--text);
 }
 
 .group-delete-question {
@@ -1575,8 +1557,7 @@ textarea {
   }
 
   .toolbar,
-  .banner-slot,
-  .groups-panel {
+  .banner-slot {
     padding: 14px 14px 0;
   }
 
