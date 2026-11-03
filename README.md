@@ -85,6 +85,12 @@ The package is written to `web-ext-artifacts/`.
   tabs, private-window tabs, the overview itself, and pages that can't be
   reopened later (anything not `http:` or `https:`) stay open. A tab is closed
   only after the archive was saved.
+- Archive one section: the archive button beside a tab group, a window, or a
+  Sorted view category (built-in or custom) archives just that section, with
+  the same rules as **Archive all**. A search narrows what is shown, not what a
+  section archive takes. The batch is named after the section, such as
+  "Research", "Window 2", or "Shopping", and keeps its windows and tab groups.
+  The page stays on the open tabs, with a link to the new batch.
 - The **Archive** view shows archived tabs with the same grouping: one section
   per archive batch with its windows and tab groups, or the **Sorted** view
   across all batches. Search works the same way as for open tabs.
