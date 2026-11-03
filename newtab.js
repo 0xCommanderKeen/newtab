@@ -15,6 +15,7 @@ import {
 } from './custom-groups.js';
 import {
   archivePlan,
+  skipReason,
   deleteBatch,
   exportArchive,
   importArchive,
@@ -124,6 +125,7 @@ const SOURCES = {
       dismiss: closeTab,
       dismissLabel: 'Close',
       middleClick: closeTab,
+      archiveSection: promptArchive,
     },
   },
   archive: {
@@ -168,8 +170,9 @@ const state = {
     archive: loadSet(ARCHIVE_COLLAPSED_KEY, toStringId),
   },
   collapsedCategories: loadSet(COLLAPSED_CATEGORIES_KEY, toStringId),
-  // null | { kind: 'confirm' } | { kind: 'busy', text }
-  //      | { kind: 'result', text, detail, tone }
+  // null | { kind: 'confirm', scope, returnFocus } | { kind: 'busy', text }
+  //      | { kind: 'result', text, detail, tone, batchId? }
+  // scope: { kind: 'all' | 'window' | 'group' | 'category', id, name, label }
   prompt: null,
   confirmDeleteBatchId: null,
   customGroups: [],
@@ -376,6 +379,7 @@ async function readOpenWindows() {
       return {
         id: win.id,
         title,
+        number: index + 1,
         focused: win.focused,
         incognito: win.incognito,
         badge: { text: `W${index + 1}`, title },
@@ -603,7 +607,7 @@ function bindArchiveControls() {
   for (const button of els.sourceButtons) {
     button.addEventListener('click', () => switchSource(button.dataset.source));
   }
-  els.archiveAll.addEventListener('click', promptArchiveAll);
+  els.archiveAll.addEventListener('click', () => promptArchive(ALL_TABS, '#archive-all'));
   els.archiveExport.addEventListener('click', downloadArchive);
   els.archiveImport.addEventListener('click', () => els.archiveImportFile.click());
   els.archiveImportFile.addEventListener('change', () => {
@@ -710,14 +714,15 @@ function renderControls() {
 // The confirm prompt recounts on every render, so tabs opened or closed while
 // it is showing are reflected before the user confirms.
 const BANNERS = {
-  confirm: () => {
-    const plan = planArchive(state.windows);
+  confirm: (prompt) => {
+    const plan = planArchive(scopeWindows(state.windows, prompt.scope));
     if (plan.count === 0) return null;
+    const where = prompt.scope.name ? ` in ${prompt.scope.name}` : '';
     return {
-      text: `Archive and close ${plural(plan.count, 'tab')}?`,
+      text: `Archive and close ${plural(plan.count, 'tab')}${where}?`,
       detail: leftOpenText(plan.skipped, 'stay open'),
       buttons: [
-      { id: 'archive-confirm', label: 'Archive and close', primary: true, onClick: confirmArchiveAll },
+      { id: 'archive-confirm', label: 'Archive and close', primary: true, onClick: confirmArchive },
         { id: 'archive-cancel', label: 'Cancel', onClick: dismissPrompt },
       ],
     };
@@ -727,9 +732,30 @@ const BANNERS = {
     text: prompt.text,
     detail: prompt.detail,
     tone: prompt.tone,
-    buttons: [{ id: 'banner-dismiss', label: 'Dismiss', onClick: dismissPrompt }],
+    buttons: [
+      ...(prompt.batchId
+        ? [{ id: 'banner-view-archive', label: 'View in archive', onClick: () => viewArchivedBatch(prompt.batchId) }]
+        : []),
+      { id: 'banner-dismiss', label: 'Dismiss', onClick: dismissPrompt },
+    ],
   }),
 };
+
+const SCOPE_MATCHERS = {
+  all: () => () => true,
+  window: (scope) => (tab, win) => win.id === scope.id,
+  group: (scope) => (tab) => tab.groupId === scope.id,
+  category: (scope) => (tab) => categorizeTab(tab, state.groupRules).id === scope.id,
+};
+
+const ALL_TABS = { kind: 'all', id: null, name: '', label: '' };
+
+function scopeWindows(windows, scope) {
+  const includes = SCOPE_MATCHERS[scope.kind](scope);
+  return windows.map((win) => ({ ...win, tabs: win.tabs.filter((tab) => includes(tab, win)) }));
+}
+
+const archivableCount = (tabs) => tabs.filter((tab) => !skipReason(tab)).length;
 
 function renderBanner() {
   const view = state.prompt && BANNERS[state.prompt.kind](state.prompt);
@@ -768,9 +794,15 @@ function renderBanner() {
 
 function dismissPrompt() {
   if (isBusy()) return;
+  const returnFocus = state.prompt?.returnFocus;
   state.prompt = null;
   render();
-  focusFirst(['#archive-all:not([hidden]):not(:disabled)', '#search']);
+  const target = returnFocus && document.querySelector(returnFocus);
+  if (target) {
+    target.focus();
+  } else {
+    focusFirst(['#archive-all:not([hidden]):not(:disabled)', '#search']);
+  }
 }
 
 function focusFirst(selectors) {
@@ -832,7 +864,7 @@ function renderBatch(batch, sections, count, ctx) {
   const tabs = count === batch.tabCount
     ? plural(count, 'tab')
     : `${count} of ${plural(batch.tabCount, 'tab')}`;
-  heading.textContent = `${formatDate(batch.archivedAt)} · ${tabs}`;
+  heading.textContent = [formatDate(batch.archivedAt), batch.label, tabs].filter(Boolean).join(' · ');
   heading.title = `Archived ${new Date(batch.archivedAt).toLocaleString()}`;
 
   const actions = el('div', 'batch-actions');
@@ -916,7 +948,9 @@ function renderEmptySearch(totalTabs, ctx) {
   els.summary.textContent = matchSummary(0, totalTabs, ctx.tabNoun);
 }
 
-const FOCUS_SCOPES = ['data-tab-id', 'data-custom-group-id', 'data-group-id', 'data-category-id', 'data-batch-id'];
+const FOCUS_SCOPES = [
+  'data-tab-id', 'data-custom-group-id', 'data-group-id', 'data-category-id', 'data-batch-id', 'data-window-id',
+];
 
 // Every render rebuilds the overview, so focus is remembered as a selector and
 // put back on the equivalent new element.
@@ -950,26 +984,30 @@ function buildCategories(windows, query) {
 
     for (const tab of win.tabs) {
       const category = categorizeTab(tab, state.groupRules);
-      const categoryMatches = category.label.toLowerCase().includes(query);
-
-      if (query && !categoryMatches && !tabMatchesQuery(tab, groupTitles.get(tab.groupId), query)) continue;
-
       if (!buckets.has(category.id)) {
         buckets.set(category.id, {
           meta: category,
           tabs: [],
+          archivable: 0,
           windows: new Set(),
         });
       }
-
       const bucket = buckets.get(category.id);
+      // A section archive takes the whole category, matched by search or not.
+      if (!skipReason(tab)) bucket.archivable += 1;
+
+      const categoryMatches = category.label.toLowerCase().includes(query);
+      if (query && !categoryMatches && !tabMatchesQuery(tab, groupTitles.get(tab.groupId), query)) continue;
+
       bucket.tabs.push({ tab, win });
       bucket.windows.add(win.id);
     }
   }
 
   const rank = (meta) => (meta.custom ? meta.order : state.customGroups.length + CATEGORY_INDEX.get(meta.id));
-  return [...buckets.values()].sort((a, b) => rank(a.meta) - rank(b.meta));
+  return [...buckets.values()]
+    .filter((bucket) => bucket.tabs.length > 0)
+    .sort((a, b) => rank(a.meta) - rank(b.meta));
 }
 
 function tabMatchesQuery(tab, groupTitle, query) {
@@ -978,7 +1016,7 @@ function tabMatchesQuery(tab, groupTitle, query) {
     (groupTitle || '').toLowerCase().includes(query);
 }
 
-function renderCategory({ meta, tabs }, ctx) {
+function renderCategory({ meta, tabs, archivable }, ctx) {
   const section = el('section', 'category');
   section.dataset.category = meta.custom ? 'custom' : meta.id;
   if (meta.custom) section.dataset.color = meta.color;
@@ -989,7 +1027,6 @@ function renderCategory({ meta, tabs }, ctx) {
   const header = document.createElement('button');
   header.type = 'button';
   header.className = 'group-header category-header';
-  header.dataset.categoryId = meta.id;
   header.setAttribute('aria-expanded', String(!isCollapsed));
   header.setAttribute('aria-label', `${meta.label}, ${plural(tabs.length, 'tab')}`);
 
@@ -1004,7 +1041,9 @@ function renderCategory({ meta, tabs }, ctx) {
 
   header.append(chevron, dot, name, count);
   header.addEventListener('click', () => toggleCategory(meta.id));
-  section.append(header);
+  section.append(headerRow('categoryId', meta.id, header, sectionArchiveButton(ctx,
+    { kind: 'category', id: meta.id, name: meta.label, label: meta.label },
+    archivable, 'category-archive', `[data-category-id="${CSS.escape(meta.id)}"] .category-archive`)));
 
   if (!isCollapsed) {
     const grid = el('div', 'group-tabs');
@@ -1015,6 +1054,30 @@ function renderCategory({ meta, tabs }, ctx) {
   }
 
   return section;
+}
+
+// The header is a toggle button, so the archive control sits beside it in a
+// row that carries the focus scope for both.
+function headerRow(scopeKey, scopeId, header, archive) {
+  const row = el('div', 'group-header-row');
+  row.dataset[scopeKey] = String(scopeId);
+  row.append(header);
+  if (archive) row.append(archive);
+  return row;
+}
+
+function sectionArchiveButton(ctx, scope, count, className, returnFocus) {
+  if (!ctx.actions.archiveSection || count === 0) return null;
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.className = `section-archive ${className}`;
+  const label = `Archive ${plural(count, 'tab')} in ${scope.name}`;
+  button.title = label;
+  button.setAttribute('aria-label', label);
+  button.disabled = isBusy();
+  button.append(createIcon(ICONS.archive));
+  button.addEventListener('click', () => ctx.actions.archiveSection(scope, returnFocus));
+  return button;
 }
 
 function toggleCategory(categoryId) {
@@ -1044,6 +1107,7 @@ function filterWindow(win, query) {
 
 function renderWindow({ win, groups, ungrouped, count }, ctx) {
   const section = el('section', 'window');
+  section.dataset.windowId = String(win.id);
   if (win.focused) section.classList.add('is-focused');
 
   const head = el('div', 'window-head');
@@ -1073,18 +1137,24 @@ function renderWindow({ win, groups, ungrouped, count }, ctx) {
     meta.append(groupCount);
   }
 
+  const archive = sectionArchiveButton(ctx, {
+    kind: 'window', id: win.id, name: win.focused ? 'the current window' : win.title, label: `Window ${win.number}`,
+  }, archivableCount(win.tabs), 'window-archive', `[data-window-id="${win.id}"] .window-archive`);
+  if (archive) meta.append(archive);
+
   head.append(titleWrap, meta);
   section.append(head);
 
+  const fullGroups = new Map(win.groups.map((group) => [group.id, group]));
   const body = el('div', 'window-body');
-  for (const group of groups) body.append(renderGroup(group, ctx));
+  for (const group of groups) body.append(renderGroup(group, ctx, fullGroups.get(group.id).tabs));
   if (ungrouped.length > 0) body.append(renderUngrouped(ungrouped, groups.length > 0, ctx));
   section.append(body);
 
   return section;
 }
 
-function renderGroup(group, ctx) {
+function renderGroup(group, ctx, allTabs) {
   const section = el('section', 'group');
   const color = GROUP_COLORS.has(group.color) ? group.color : 'grey';
   section.dataset.color = color;
@@ -1095,7 +1165,6 @@ function renderGroup(group, ctx) {
   const header = document.createElement('button');
   header.type = 'button';
   header.className = 'group-header';
-  header.dataset.groupId = String(group.id);
   header.setAttribute('aria-expanded', String(!isCollapsed));
   header.setAttribute(
     'aria-label',
@@ -1113,7 +1182,10 @@ function renderGroup(group, ctx) {
 
   header.append(chevron, dot, name, count);
   header.addEventListener('click', () => toggleGroup(ctx, group.id));
-  section.append(header);
+  const groupName = group.title || 'Untitled group';
+  section.append(headerRow('groupId', group.id, header, sectionArchiveButton(ctx,
+    { kind: 'group', id: group.id, name: groupName, label: groupName },
+    archivableCount(allTabs), 'group-archive', `[data-group-id="${CSS.escape(String(group.id))}"] .group-archive`)));
 
   if (!isCollapsed) {
     const tabs = el('div', 'group-tabs');
@@ -1388,24 +1460,25 @@ async function closeTab(tab) {
   }
 }
 
-function promptArchiveAll() {
+function promptArchive(scope = ALL_TABS, returnFocus = '') {
   if (isBusy()) return;
-  if (planArchive(state.windows).count === 0) return;
-  state.prompt = { kind: 'confirm' };
+  if (planArchive(scopeWindows(state.windows, scope)).count === 0) return;
+  state.prompt = { kind: 'confirm', scope, returnFocus };
   render();
   document.getElementById('archive-confirm')?.focus();
 }
 
-async function confirmArchiveAll() {
-  if (isBusy()) return;
+async function confirmArchive() {
+  if (isBusy() || state.prompt?.kind !== 'confirm') return;
+  const { scope } = state.prompt;
   state.prompt = { kind: 'busy', text: 'Archiving tabs…' };
   render();
 
   let result;
   try {
     // Re-read so tabs opened or closed since the confirmation are accounted for.
-    const plan = planArchive(await readOpenWindows());
-    const { archived, closeFailed } = await archivePlan(plan);
+    const plan = planArchive(scopeWindows(await readOpenWindows(), scope));
+    const { archived, closeFailed, batchId } = await archivePlan(plan, scope.label);
     const notes = [leftOpenText(plan.skipped, 'left open')];
     if (closeFailed > 0) {
       notes.push(`${plural(closeFailed, 'archived tab')} changed or could not be closed and ` +
@@ -1413,14 +1486,16 @@ async function confirmArchiveAll() {
     }
     result = {
       kind: 'result',
-      text: `Archived ${plural(archived, 'tab')}`,
+      text: `Archived ${plural(archived, 'tab')}${scope.name ? ` from ${scope.name}` : ''}`,
       detail: notes.filter(Boolean).join(' '),
       tone: closeFailed > 0 ? 'warn' : '',
     };
-    if (archived > 0) {
+    if (archived > 0 && scope.kind === 'all') {
       state.source = 'archive';
       saveValue(SOURCE_KEY, 'archive');
       applyViewButtons();
+    } else if (archived > 0) {
+      result.batchId = batchId;
     }
   } catch (error) {
     console.error('Tab Overview: archive failed', error);
@@ -1435,6 +1510,13 @@ async function confirmArchiveAll() {
   state.prompt = result;
   await refresh();
   focusFirst(['#banner-dismiss']);
+}
+
+function viewArchivedBatch(batchId) {
+  state.prompt = null;
+  switchSource('archive');
+  render();
+  focusFirst([`[data-batch-id="${CSS.escape(batchId)}"] .batch-restore`, '#search']);
 }
 
 async function restoreArchivedBatch(batch) {
@@ -1733,7 +1815,6 @@ function closeGroupsPanel() {
 function renderGroupsPanel() {
   if (!EXTENSION_STORAGE) return;
   els.groupsOpen.setAttribute('aria-expanded', String(state.panelOpen));
-  els.groupsOpen.classList.toggle('is-active', state.panelOpen);
   els.groupsPanel.hidden = !state.panelOpen;
   if (!state.panelOpen) {
     els.groupsPanel.replaceChildren();

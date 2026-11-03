@@ -5,13 +5,15 @@ import { GROUP_COLORS, loadGroups, mergeGroups } from './custom-groups.js';
 // Each archive batch lives under its own storage.local key, so two overview
 // pages acting on different batches never overwrite each other.
 //
-// Stored batch  { id, archivedAt, windows: [StoredWindow] }
+// Stored batch  { id, archivedAt, label?, windows: [StoredWindow] }
+//               label names the section a batch was archived from, such as
+//               a tab group, window, or category; Archive all has none
 // StoredWindow  { id, title, groups: [StoredGroup], ungrouped: [StoredTab] }
 // StoredGroup   { id, title, color, tabs: [StoredTab] }
 // StoredTab     { id, title, url, favIconUrl? }   favIconUrl only as data: URL
 //
 // Batch in memory (what the overview renders):
-// ArchiveBatch  { id, archivedAt, tabCount, windows: [ArchiveWindow] }
+// ArchiveBatch  { id, archivedAt, label, tabCount, windows: [ArchiveWindow] }
 // ArchiveWindow { id, title, groups: [ArchiveGroup], ungrouped, tabs }
 //               tabs = every tab of the window, groups first, then ungrouped
 // ArchiveGroup  { id, title, color, tabs }
@@ -21,6 +23,7 @@ const BATCH_PREFIX = 'archive:batch:';
 const BACKUP_FORMAT = 'tab-overview-backup';
 const BACKUP_VERSION = 1;
 const MAX_ID_LENGTH = 200;
+const MAX_LABEL_LENGTH = 120;
 
 export const isBatchKey = (key) => key.startsWith(BATCH_PREFIX);
 const keyOf = (batchId) => BATCH_PREFIX + batchId;
@@ -87,8 +90,8 @@ export function planArchive(windows) {
  * the write fails no tab is closed. A tab that navigated since it was read is
  * left open, because the archive holds its old address.
  */
-export async function archivePlan(plan) {
-  if (plan.count === 0) return { archived: 0, closeFailed: 0 };
+export async function archivePlan(plan, label = '') {
+  if (plan.count === 0) return { archived: 0, closeFailed: 0, batchId: null };
 
   const toStoredTab = (tab) => {
     const url = urlOf(tab);
@@ -100,6 +103,7 @@ export async function archivePlan(plan) {
   const batch = {
     id: crypto.randomUUID(),
     archivedAt: Date.now(),
+    ...(label ? { label } : {}),
     windows: plan.windows.map((win, index) => ({
       id: crypto.randomUUID(),
       title: `Window ${index + 1}`,
@@ -129,7 +133,7 @@ export async function archivePlan(plan) {
     .map((tab) => tab.id);
 
   const closeFailed = savedUrls.size - unchanged.length + await closeTabs(unchanged);
-  return { archived: plan.count, closeFailed };
+  return { archived: plan.count, closeFailed, batchId: batch.id };
 }
 
 async function closeTabs(ids) {
@@ -186,7 +190,13 @@ function toModel(batch) {
     };
   });
 
-  return { id: batch.id, archivedAt: batch.archivedAt, tabCount: countTabs(batch), windows };
+  return {
+    id: batch.id,
+    archivedAt: batch.archivedAt,
+    label: batch.label ?? '',
+    tabCount: countTabs(batch),
+    windows,
+  };
 }
 
 /* ------------------------------------------------------------- validation */
@@ -209,9 +219,11 @@ function normalizeBatch(raw, id, fallbackArchivedAt) {
     .filter(Boolean);
   if (windows.length === 0) return null;
 
+  const label = stringOr(raw.label, '').trim().slice(0, MAX_LABEL_LENGTH);
   return {
     id,
     archivedAt: Number.isFinite(raw.archivedAt) ? raw.archivedAt : fallbackArchivedAt,
+    ...(label ? { label } : {}),
     windows,
   };
 }

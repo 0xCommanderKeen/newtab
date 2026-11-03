@@ -192,6 +192,11 @@ textarea {
   outline-offset: 1px;
 }
 
+.button[aria-expanded="true"] {
+  border-color: var(--accent-border);
+  background: var(--accent-soft);
+}
+
 .button:disabled {
   opacity: 0.5;
   cursor: default;
@@ -727,12 +732,20 @@ textarea {
   }
 }
 
-.group-header {
+.group-header-row {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 4px;
   width: calc(100% + 16px);
   margin: 0 -8px;
+}
+
+.group-header {
+  display: flex;
+  flex: 1;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
   padding: 6px 8px;
   border: 0;
   border-radius: 8px;
@@ -770,6 +783,55 @@ textarea {
 
 .group.is-collapsed .group-chevron {
   transform: rotate(-90deg);
+}
+
+.section-archive {
+  display: grid;
+  place-items: center;
+  flex: none;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--text-3);
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.12s ease, background-color 0.12s ease, color 0.12s ease;
+}
+
+.section-archive svg {
+  display: block;
+  width: 16px;
+  height: 16px;
+}
+
+.group-header-row:hover .section-archive,
+.group-header-row:focus-within .section-archive,
+.window-head:hover .section-archive,
+.window-head:focus-within .section-archive,
+.section-archive:focus-visible {
+  opacity: 1;
+}
+
+.section-archive:hover:not(:disabled) {
+  background: var(--bg-soft);
+  color: var(--text);
+}
+
+.section-archive:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -1px;
+}
+
+.section-archive:disabled {
+  cursor: default;
+}
+
+.window-archive {
+  width: 26px;
+  height: 26px;
 }
 
 .group-dot {
@@ -1024,7 +1086,8 @@ textarea {
 
 @media (hover: none) {
   .tab-close,
-  .tab-menu-button {
+  .tab-menu-button,
+  .section-archive {
     opacity: 0.65;
   }
 }
