@@ -1,5 +1,7 @@
 'use strict';
 
+import { GROUP_COLORS, loadGroups, mergeGroups } from './custom-groups.js';
+
 // Each archive batch lives under its own storage.local key, so two overview
 // pages acting on different batches never overwrite each other.
 //
@@ -19,10 +21,6 @@ const BATCH_PREFIX = 'archive:batch:';
 const BACKUP_FORMAT = 'tab-overview-backup';
 const BACKUP_VERSION = 1;
 const MAX_ID_LENGTH = 200;
-
-export const GROUP_COLORS = new Set([
-  'grey', 'blue', 'red', 'yellow', 'green', 'pink', 'purple', 'cyan', 'orange',
-]);
 
 export const isBatchKey = (key) => key.startsWith(BATCH_PREFIX);
 const keyOf = (batchId) => BATCH_PREFIX + batchId;
@@ -410,13 +408,15 @@ export async function exportArchive() {
     .map(([key, raw]) => normalizeBatch(raw, key.slice(BATCH_PREFIX.length), 0))
     .filter(Boolean)
     .sort((a, b) => b.archivedAt - a.archivedAt);
-  return { format: BACKUP_FORMAT, version: BACKUP_VERSION, exportedAt: Date.now(), archive };
+  const customGroups = await loadGroups();
+  return { format: BACKUP_FORMAT, version: BACKUP_VERSION, exportedAt: Date.now(), archive, customGroups };
 }
 
 /**
- * Adds the batches from a backup file. A batch whose id is already in the
- * archive is skipped, and a batch without an id gets one derived from its
- * content, so importing the same file twice changes nothing.
+ * Adds the batches and custom groups from a backup file. A batch or group
+ * whose id is already present is skipped, and a batch without an id gets one
+ * derived from its content, so importing the same file twice changes nothing.
+ * Backups written before custom groups existed have no customGroups field.
  */
 export async function importArchive(text) {
   let data;
@@ -436,7 +436,7 @@ export async function importArchive(text) {
   const taken = new Set(Object.keys(stored).filter(isBatchKey));
   const fallbackArchivedAt = Number.isFinite(data.exportedAt) ? data.exportedAt : Date.now();
   const additions = {};
-  const result = { batches: 0, tabs: 0, skipped: 0, invalid: 0 };
+  const result = { batches: 0, tabs: 0, skipped: 0, invalid: 0, groups: 0, groupsSkipped: 0 };
 
   for (const raw of data.archive) {
     const id = validId(raw?.id) ? raw.id : contentId(raw);
@@ -456,5 +456,8 @@ export async function importArchive(text) {
   }
 
   if (result.batches > 0) await chrome.storage.local.set(additions);
+  const { added, skipped } = await mergeGroups(data.customGroups);
+  result.groups = added;
+  result.groupsSkipped = skipped;
   return result;
 }

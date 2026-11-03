@@ -652,76 +652,111 @@ input {
 
 /* ------------------------------------------------------------------ groups */
 
-.group[data-color="grey"] {
+.group[data-color="grey"],
+
+.category[data-color="grey"] {
   --group-color: #5f6368;
 }
 
-.group[data-color="blue"] {
+.group[data-color="blue"],
+
+.category[data-color="blue"] {
   --group-color: #1a73e8;
 }
 
-.group[data-color="red"] {
+.group[data-color="red"],
+
+.category[data-color="red"] {
   --group-color: #d93025;
 }
 
-.group[data-color="yellow"] {
+.group[data-color="yellow"],
+
+.category[data-color="yellow"] {
   --group-color: #f9ab00;
 }
 
-.group[data-color="green"] {
+.group[data-color="green"],
+
+.category[data-color="green"] {
   --group-color: #1e8e3e;
 }
 
-.group[data-color="pink"] {
+.group[data-color="pink"],
+
+.category[data-color="pink"] {
   --group-color: #d01884;
 }
 
-.group[data-color="purple"] {
+.group[data-color="purple"],
+
+.category[data-color="purple"] {
   --group-color: #a142f4;
 }
 
-.group[data-color="cyan"] {
+.group[data-color="cyan"],
+
+.category[data-color="cyan"] {
   --group-color: #007b83;
 }
 
-.group[data-color="orange"] {
+.group[data-color="orange"],
+
+.category[data-color="orange"] {
   --group-color: #fa903e;
 }
 
 @media (prefers-color-scheme: dark) {
-  .group[data-color="grey"] {
+  .group[data-color="grey"],
+  .category[data-color="grey"] {
     --group-color: #9aa0a6;
   }
 
-  .group[data-color="blue"] {
+  .group[data-color="blue"],
+
+  .category[data-color="blue"] {
     --group-color: #8ab4f8;
   }
 
-  .group[data-color="red"] {
+  .group[data-color="red"],
+
+  .category[data-color="red"] {
     --group-color: #f28b82;
   }
 
-  .group[data-color="yellow"] {
+  .group[data-color="yellow"],
+
+  .category[data-color="yellow"] {
     --group-color: #fdd663;
   }
 
-  .group[data-color="green"] {
+  .group[data-color="green"],
+
+  .category[data-color="green"] {
     --group-color: #81c995;
   }
 
-  .group[data-color="pink"] {
+  .group[data-color="pink"],
+
+  .category[data-color="pink"] {
     --group-color: #ff8bcb;
   }
 
-  .group[data-color="purple"] {
+  .group[data-color="purple"],
+
+  .category[data-color="purple"] {
     --group-color: #c58af9;
   }
 
-  .group[data-color="cyan"] {
+  .group[data-color="cyan"],
+
+  .category[data-color="cyan"] {
     --group-color: #78d9ec;
   }
 
-  .group[data-color="orange"] {
+  .group[data-color="orange"],
+
+  .category[data-color="orange"] {
     --group-color: #fcad70;
   }
 }

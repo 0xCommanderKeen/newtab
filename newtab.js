@@ -1,8 +1,18 @@
 'use strict';
 
-import { CATEGORY_INDEX, categorizeTab } from './categories.js';
+import { CATEGORY_INDEX, categorizeTab, compileCustomGroups } from './categories.js';
 import {
+  GROUPS_KEY,
   GROUP_COLORS,
+  assignDomain,
+  createGroup,
+  deleteGroup,
+  editGroup,
+  loadGroups,
+  moveGroup,
+  unassignDomain,
+} from './custom-groups.js';
+import {
   archivePlan,
   deleteBatch,
   exportArchive,
@@ -29,8 +39,8 @@ const VIEW_KEY = 'tabOverview.view';
 const SOURCE_KEY = 'tabOverview.source';
 const OPENED_AT_PREFIX = 'tabOpenedAt:';
 const VIEWS = new Set(['windows', 'sorted']);
-const ARCHIVE_AVAILABLE = Boolean(globalThis.chrome?.storage?.local?.get);
-const SOURCE_NAMES = new Set(ARCHIVE_AVAILABLE ? ['open', 'archive'] : ['open']);
+const EXTENSION_STORAGE = Boolean(globalThis.chrome?.storage?.local?.get);
+const SOURCE_NAMES = new Set(EXTENSION_STORAGE ? ['open', 'archive'] : ['open']);
 const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
 
 const ICONS = {
@@ -85,6 +95,10 @@ const ICONS = {
     '<rect x="3" y="4" width="18" height="5" rx="1.5" stroke="currentColor" ' +
     'stroke-width="1.6"/><path d="M5 9v9a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V9M10 13h4" ' +
     'stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>',
+  more:
+    '<svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">' +
+    '<circle cx="3.5" cy="8" r="1.3"/><circle cx="8" cy="8" r="1.3"/>' +
+    '<circle cx="12.5" cy="8" r="1.3"/></svg>',
 };
 
 const SOURCES = {
@@ -157,6 +171,12 @@ const state = {
   //      | { kind: 'result', text, detail, tone }
   prompt: null,
   confirmDeleteBatchId: null,
+  customGroups: [],
+  groupRules: compileCustomGroups([]),
+  // null | { key, host, naming, draft }: the open tab card menu
+  menu: null,
+  panelOpen: false,
+  confirmDeleteGroupId: null,
   loading: true,
 };
 
@@ -214,8 +234,8 @@ async function requestTimeSync() {
   }
 }
 
-const LOADERS = ARCHIVE_AVAILABLE
-  ? { open: loadOpen, archive: loadArchiveState }
+const LOADERS = EXTENSION_STORAGE
+  ? { open: loadOpen, archive: loadArchiveState, groups: loadCustomGroups }
   : { open: loadOpen };
 const pendingParts = new Set();
 
@@ -317,6 +337,15 @@ async function loadArchiveState() {
     console.error('Tab Overview: failed to read the archive', error);
     state.archiveError = error;
   }
+}
+
+async function loadCustomGroups() {
+  try {
+    state.customGroups = await loadGroups();
+  } catch (error) {
+    console.error('Tab Overview: failed to read custom groups', error);
+  }
+  state.groupRules = compileCustomGroups(state.customGroups);
 }
 
 async function readOpenWindows() {
@@ -444,8 +473,11 @@ function bindEvents() {
     if (areaName === 'session' && keys.some((key) => key.startsWith(OPENED_AT_PREFIX))) {
       reload();
     }
-    if (areaName === 'local' && ARCHIVE_AVAILABLE && keys.some(isBatchKey)) {
+    if (areaName === 'local' && EXTENSION_STORAGE && keys.some(isBatchKey)) {
       scheduleRefresh('archive');
+    }
+    if (areaName === 'local' && EXTENSION_STORAGE && keys.includes(GROUPS_KEY)) {
+      scheduleRefresh('groups');
     }
   });
 }
@@ -543,8 +575,8 @@ function applyViewButtons() {
 }
 
 function bindArchiveControls() {
-  els.sourceSwitch.hidden = !ARCHIVE_AVAILABLE;
-  if (!ARCHIVE_AVAILABLE) return;
+  els.sourceSwitch.hidden = !EXTENSION_STORAGE;
+  if (!EXTENSION_STORAGE) return;
 
   for (const button of els.sourceButtons) {
     button.addEventListener('click', () => switchSource(button.dataset.source));
@@ -630,7 +662,7 @@ function renderSource(ctx) {
 }
 
 function renderControls() {
-  if (!ARCHIVE_AVAILABLE) return;
+  if (!EXTENSION_STORAGE) return;
   const busy = isBusy();
   const archived = state.batches.reduce((sum, batch) => sum + batch.tabCount, 0);
   els.archiveCount.textContent = String(archived);
@@ -893,7 +925,7 @@ function buildCategories(windows, query) {
     const groupTitles = new Map(win.groups.map((group) => [group.id, group.title]));
 
     for (const tab of win.tabs) {
-      const category = categorizeTab(tab);
+      const category = categorizeTab(tab, state.groupRules);
       const categoryMatches = category.label.toLowerCase().includes(query);
 
       if (query && !categoryMatches && !tabMatchesQuery(tab, groupTitles.get(tab.groupId), query)) continue;
@@ -912,9 +944,8 @@ function buildCategories(windows, query) {
     }
   }
 
-  return [...buckets.values()].sort(
-    (a, b) => (CATEGORY_INDEX.get(a.meta.id) ?? 99) - (CATEGORY_INDEX.get(b.meta.id) ?? 99),
-  );
+  const rank = (meta) => (meta.custom ? meta.order : state.customGroups.length + CATEGORY_INDEX.get(meta.id));
+  return [...buckets.values()].sort((a, b) => rank(a.meta) - rank(b.meta));
 }
 
 function tabMatchesQuery(tab, groupTitle, query) {
@@ -925,7 +956,8 @@ function tabMatchesQuery(tab, groupTitle, query) {
 
 function renderCategory({ meta, tabs }, ctx) {
   const section = el('section', 'category');
-  section.dataset.category = meta.id;
+  section.dataset.category = meta.custom ? 'custom' : meta.id;
+  if (meta.custom) section.dataset.color = meta.color;
 
   const isCollapsed = ctx.query === '' && state.collapsedCategories.has(meta.id);
   if (isCollapsed) section.classList.add('is-collapsed');
