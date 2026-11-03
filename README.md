@@ -7,6 +7,8 @@ overview of every open tab, tab group, and window. Everything runs locally.
 
 ![Tab Overview sorted view](screenshot-sorted.png)
 
+![Tab Overview archive view](screenshot-archive.png)
+
 ## Is this feasible?
 
 Yes. Chrome and Firefox have supported new tab page overrides for years, and
@@ -224,6 +226,7 @@ archive.js        Tab archive storage, archive all, restore, export, and import
 icons/            Extension icons (SVG source + PNG sizes)
 screenshot.png    Window view preview
 screenshot-sorted.png  Sorted view preview
+screenshot-archive.png  Archive view preview
 ```
 
 ## License
