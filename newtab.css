@@ -1073,8 +1073,15 @@ textarea {
 
 .tab.is-suspended .tab-favicon,
 .tab.is-suspended .tab-text {
-  opacity: 0.55;
+  opacity: 0.6;
   transition: opacity 0.12s ease;
+}
+
+/* The age says when it was suspended, so it has to stay readable once dimmed. */
+.tab.is-suspended .tab-url,
+.tab.is-suspended .tab-age,
+.tab.is-suspended .tab-flags {
+  color: var(--text-2);
 }
 
 .tab.is-suspended .tab-favicon {

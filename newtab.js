@@ -1712,7 +1712,7 @@ async function reopenScope(scope, returnFocus = '') {
 
   state.prompt = result;
   await refresh(['open']);
-  focusFirst([...(result ? ['#banner-dismiss'] : []), returnFocus.replace(/-reopen$/, '-suspend'), '#search']);
+  focusFirst([...(result ? ['#banner-dismiss'] : []), ...(returnFocus ? [returnFocus.replace(/-reopen$/, '-suspend')] : []), '#search']);
 }
 
 async function reopenTab(tab) {

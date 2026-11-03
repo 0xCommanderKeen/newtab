@@ -439,9 +439,7 @@ export function backgroundTabCreator() {
  */
 export async function regroup(win, created, windowId) {
   if (!chrome.tabs.group) return;
-  const open = chrome.tabGroups?.query
-    ? (await chrome.tabGroups.query({ windowId }).catch(() => [])).filter((group) => group.windowId === windowId)
-    : [];
+  const open = await chrome.tabGroups?.query?.({ windowId }).catch(() => []) ?? [];
 
   for (const group of win.groups) {
     const tabIds = group.tabs.map((tab) => created.get(tab.id)).filter((id) => typeof id === 'number');
