@@ -18,6 +18,12 @@ import { GROUP_COLORS, loadGroups, mergeGroups } from './custom-groups.js';
 //               tabs = every tab of the window, groups first, then ungrouped
 // ArchiveGroup  { id, title, color, tabs }
 // ArchivedTab   { id, batchId, title, url, favIconUrl, groupId, archivedAt }
+//
+// A suspended tab is closed in the browser but still listed with the open
+// tabs. Each one has its own key, for the same reason as a batch:
+// Suspended     { id, url, title, favIconUrl?, suspendedAt, windowId, index,
+//                 group: { title, color } | null }
+//               windowId, index, and group describe where the tab was open
 
 const BATCH_PREFIX = 'archive:batch:';
 const BACKUP_FORMAT = 'tab-overview-backup';
@@ -25,7 +31,11 @@ const BACKUP_VERSION = 1;
 const MAX_ID_LENGTH = 200;
 const MAX_LABEL_LENGTH = 120;
 
+const SUSPENDED_PREFIX = 'suspended:';
+
 export const isBatchKey = (key) => key.startsWith(BATCH_PREFIX);
+export const isSuspendedKey = (key) => key.startsWith(SUSPENDED_PREFIX);
+export const suspendedKey = (id) => SUSPENDED_PREFIX + id;
 const keyOf = (batchId) => BATCH_PREFIX + batchId;
 // While Chrome navigates, url is still the old page and pendingUrl the new one.
 export const urlOf = (tab) => (isReopenable(tab.pendingUrl) ? tab.pendingUrl : tab.url || tab.pendingUrl || '');
@@ -270,6 +280,23 @@ function normalizeTabs(raw, idBase, idFor) {
     .filter(Boolean);
 }
 
+export function normalizeSuspended(raw, id, fallbackSuspendedAt = 0) {
+  if (!isObject(raw) || !isReopenable(raw.url)) return null;
+  const entry = {
+    id,
+    url: raw.url,
+    title: stringOr(raw.title, '') || raw.url,
+    suspendedAt: Number.isFinite(raw.suspendedAt) ? raw.suspendedAt : fallbackSuspendedAt,
+    windowId: Number.isInteger(raw.windowId) ? raw.windowId : null,
+    index: Number.isInteger(raw.index) && raw.index >= 0 ? raw.index : 0,
+    group: isObject(raw.group)
+      ? { title: stringOr(raw.group.title, ''), color: GROUP_COLORS.has(raw.group.color) ? raw.group.color : 'grey' }
+      : null,
+  };
+  if (typeof raw.favIconUrl === 'string' && /^data:/i.test(raw.favIconUrl)) entry.favIconUrl = raw.favIconUrl;
+  return entry;
+}
+
 function contentId(value) {
   const text = JSON.stringify(value) ?? '';
   let a = 0x811c9dc5;
@@ -434,6 +461,19 @@ export async function regroup(win, created, windowId) {
 // Group ids change when a group is recreated or the browser restarts, so a
 // group is recognized by what the user sees.
 export const sameGroup = (a, b) => (a.title || '') === (b.title || '') && a.color === b.color;
+
+export async function loadSuspended() {
+  const stored = await chrome.storage.local.get(null);
+  return Object.entries(stored)
+    .filter(([key]) => isSuspendedKey(key))
+    .map(([key, raw]) => normalizeSuspended(raw, key.slice(SUSPENDED_PREFIX.length)))
+    .filter(Boolean)
+    .sort((a, b) => a.suspendedAt - b.suspendedAt);
+}
+
+export function forgetSuspended(ids) {
+  return Promise.all(ids.map((id) => withKeyLock(suspendedKey(id), () => chrome.storage.local.remove(suspendedKey(id)))));
+}
 
 export function deleteBatch(batchId) {
   return withBatchLock(batchId, () => chrome.storage.local.remove(keyOf(batchId)));
