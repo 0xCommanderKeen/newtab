@@ -61,8 +61,8 @@ The package is written to `web-ext-artifacts/`.
 
 - Every window, with the current window first.
 - A **Sorted** view that groups all tabs across windows by category: AI,
-  Shopping, Development, Work, News & Reading, Social, Media, Finance,
-  Learning, Travel, Health, and Other.
+  Shopping, Development, Work, News & Reading, Social, Media, Games, Finance,
+  Crypto & DeFi, Learning, Making, Travel, Health, Homelab, and Other.
 - Tab groups shown with their Chrome title and color.
 - Shows how long ago each tab was opened, with the exact time in the tooltip.
 - Pinned, audible, muted, and sleeping (discarded) tabs are marked.
@@ -85,6 +85,13 @@ generic news or social domains. For example:
 - An Amazon product page stays in Shopping even if its title mentions AI.
 - An AI article on a news site goes to AI.
 - A GitHub repository stays in Development unless its title is strongly AI-related.
+- Games, Crypto & DeFi, Making, and Homelab match by domain only, so a page
+  never lands there because of a word in its title.
+- Homelab also takes web pages on private IPv4 addresses (`192.168.x.x`,
+  `10.x.x.x`, `172.16–31.x.x`), on `.local`, `.lan`, `.home.arpa`, and
+  `.internal` names, and on dotless intranet names like `http://nas:8096`.
+  `localhost` and `127.0.0.1` go to Development, since they're usually dev
+  servers.
 - Unknown sites fall back to title keywords, then Other.
 
 Nothing reads the page content, makes a network request, or sends data anywhere.

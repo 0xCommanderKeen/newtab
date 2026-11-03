@@ -309,6 +309,22 @@ input {
   --group-color: #22c55e;
 }
 
+.category[data-category="games"] {
+  --group-color: #84cc16;
+}
+
+.category[data-category="crypto"] {
+  --group-color: #d946ef;
+}
+
+.category[data-category="making"] {
+  --group-color: #e11d48;
+}
+
+.category[data-category="homelab"] {
+  --group-color: #f97316;
+}
+
 .category[data-category="other"] {
   --group-color: #64748b;
 }
@@ -356,6 +372,22 @@ input {
 
   .category[data-category="health"] {
     --group-color: #86efac;
+  }
+
+  .category[data-category="games"] {
+    --group-color: #bef264;
+  }
+
+  .category[data-category="crypto"] {
+    --group-color: #f0abfc;
+  }
+
+  .category[data-category="making"] {
+    --group-color: #fda4af;
+  }
+
+  .category[data-category="homelab"] {
+    --group-color: #fdba74;
   }
 
   .category[data-category="other"] {
