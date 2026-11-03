@@ -189,6 +189,7 @@ function init() {
   }
 
   bindEvents();
+  bindPointerHold();
   bindSearch();
   bindViewSwitch();
   bindArchiveControls();
@@ -232,11 +233,37 @@ async function refresh(parts = Object.keys(LOADERS)) {
 function scheduleRefresh(part) {
   pendingParts.add(part);
   clearTimeout(refreshTimer);
-  refreshTimer = setTimeout(() => {
-    const parts = [...pendingParts];
-    pendingParts.clear();
-    refresh(parts);
-  }, 80);
+  refreshTimer = setTimeout(flushRefresh, 80);
+}
+
+// A render replaces the page's buttons, and a button replaced between mousedown
+// and mouseup never gets the click. Tab events arrive several times a second
+// while pages load, so event-driven refreshes wait until the pointer is
+// released. The 2 s cap covers a release outside the window that never reports.
+let pointerDownAt = 0;
+
+function flushRefresh() {
+  if (pendingParts.size === 0) return;
+  if (pointerDownAt && Date.now() - pointerDownAt < 2000) {
+    refreshTimer = setTimeout(flushRefresh, 100);
+    return;
+  }
+  const parts = [...pendingParts];
+  pendingParts.clear();
+  refresh(parts);
+}
+
+function bindPointerHold() {
+  document.addEventListener('pointerdown', () => {
+    pointerDownAt = Date.now();
+  }, true);
+  const release = () => {
+    pointerDownAt = 0;
+    clearTimeout(refreshTimer);
+    refreshTimer = setTimeout(flushRefresh, 0);
+  };
+  document.addEventListener('pointerup', release, true);
+  document.addEventListener('pointercancel', release, true);
 }
 
 async function loadOpen() {
