@@ -1092,10 +1092,11 @@ textarea {
   filter: grayscale(1);
 }
 
+/* :focus-visible, because focus lands on a card after a suspend by mouse too. */
 .tab.is-suspended:hover .tab-favicon,
 .tab.is-suspended:hover .tab-text,
-.tab.is-suspended:focus-within .tab-favicon,
-.tab.is-suspended:focus-within .tab-text {
+.tab.is-suspended:has(:focus-visible) .tab-favicon,
+.tab.is-suspended:has(:focus-visible) .tab-text {
   opacity: 0.85;
 }
 

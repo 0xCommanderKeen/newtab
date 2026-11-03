@@ -1929,7 +1929,7 @@ async function importArchiveFile(file) {
     result = { kind: 'result', text: 'Nothing was imported', detail: error?.message || '', tone: 'error' };
   }
   state.prompt = result;
-  await refresh(['archive', 'groups', 'open']);
+  await refresh(['archive', 'groups']);
 }
 
 /* ----------------------------------------------------------- custom groups */
