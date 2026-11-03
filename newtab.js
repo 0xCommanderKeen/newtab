@@ -1,9 +1,21 @@
 'use strict';
 
-import { CATEGORY_INDEX, categorizeTab } from './categories.js';
+import { CATEGORY_INDEX, categorizeTab, compileCustomGroups, matchCustomDomain } from './categories.js';
 import {
+  GROUPS_KEY,
   GROUP_COLORS,
+  assignDomain,
+  createGroup,
+  deleteGroup,
+  editGroup,
+  loadGroups,
+  moveGroup,
+  normalizeDomain,
+  unassignDomain,
+} from './custom-groups.js';
+import {
   archivePlan,
+  skipReason,
   deleteBatch,
   exportArchive,
   importArchive,
@@ -29,8 +41,8 @@ const VIEW_KEY = 'tabOverview.view';
 const SOURCE_KEY = 'tabOverview.source';
 const OPENED_AT_PREFIX = 'tabOpenedAt:';
 const VIEWS = new Set(['windows', 'sorted']);
-const ARCHIVE_AVAILABLE = Boolean(globalThis.chrome?.storage?.local?.get);
-const SOURCE_NAMES = new Set(ARCHIVE_AVAILABLE ? ['open', 'archive'] : ['open']);
+const EXTENSION_STORAGE = Boolean(globalThis.chrome?.storage?.local?.get);
+const SOURCE_NAMES = new Set(EXTENSION_STORAGE ? ['open', 'archive'] : ['open']);
 const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
 
 const ICONS = {
@@ -85,6 +97,14 @@ const ICONS = {
     '<rect x="3" y="4" width="18" height="5" rx="1.5" stroke="currentColor" ' +
     'stroke-width="1.6"/><path d="M5 9v9a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V9M10 13h4" ' +
     'stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>',
+  more:
+    '<svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">' +
+    '<circle cx="3.5" cy="8" r="1.3"/><circle cx="8" cy="8" r="1.3"/>' +
+    '<circle cx="12.5" cy="8" r="1.3"/></svg>',
+  pencil:
+    '<svg viewBox="0 0 16 16" fill="none" aria-hidden="true">' +
+    '<path d="M10.5 3.5l2 2L6 12l-2.6.6L4 10z" stroke="currentColor" stroke-width="1.5" ' +
+    'stroke-linejoin="round"/></svg>',
 };
 
 const SOURCES = {
@@ -109,6 +129,7 @@ const SOURCES = {
       dismiss: closeTab,
       dismissLabel: 'Close',
       middleClick: closeTab,
+      archiveSection: promptArchive,
     },
   },
   archive: {
@@ -153,10 +174,15 @@ const state = {
     archive: loadSet(ARCHIVE_COLLAPSED_KEY, toStringId),
   },
   collapsedCategories: loadSet(COLLAPSED_CATEGORIES_KEY, toStringId),
-  // null | { kind: 'confirm' } | { kind: 'busy', text }
-  //      | { kind: 'result', text, detail, tone }
+  // null | { kind: 'confirm', scope, returnFocus } | { kind: 'busy', text }
+  //      | { kind: 'result', text, detail, tone, batchId? }
+  // scope: { kind: 'all' | 'window' | 'group' | 'category', id, name, label }
   prompt: null,
   confirmDeleteBatchId: null,
+  customGroups: [],
+  groupRules: compileCustomGroups([]),
+  // null | { key, host, naming, draft }: the open tab card menu
+  menu: null,
   loading: true,
 };
 
@@ -174,14 +200,15 @@ function init() {
   els.viewButtons = document.querySelectorAll('.view-button[data-view]');
   els.sourceSwitch = document.getElementById('source-switch');
   els.sourceButtons = document.querySelectorAll('.source-button');
+  els.openCount = document.getElementById('open-count');
   els.archiveCount = document.getElementById('archive-count');
   els.archiveAll = document.getElementById('archive-all');
-  els.archiveTools = document.getElementById('archive-tools');
   els.archiveExport = document.getElementById('archive-export');
   els.archiveImport = document.getElementById('archive-import');
   els.archiveImportFile = document.getElementById('archive-import-file');
   els.banner = document.getElementById('banner');
   els.footerHint = document.getElementById('footer-hint');
+  els.groupsAdd = document.getElementById('groups-add');
 
   if (!globalThis.chrome?.tabs?.query || !globalThis.chrome?.windows?.getAll) {
     renderUnsupported();
@@ -193,6 +220,7 @@ function init() {
   bindSearch();
   bindViewSwitch();
   bindArchiveControls();
+  bindCustomGroups();
   applyViewButtons();
 
   requestTimeSync()
@@ -214,8 +242,8 @@ async function requestTimeSync() {
   }
 }
 
-const LOADERS = ARCHIVE_AVAILABLE
-  ? { open: loadOpen, archive: loadArchiveState }
+const LOADERS = EXTENSION_STORAGE
+  ? { open: loadOpen, archive: loadArchiveState, groups: loadCustomGroups }
   : { open: loadOpen };
 const pendingParts = new Set();
 
@@ -227,13 +255,7 @@ async function refresh(parts = Object.keys(LOADERS)) {
   if (isBusy()) return;
   await Promise.all(parts.map((part) => LOADERS[part]()));
   state.loading = false;
-  if (pointerHeld()) {
-    renderDeferred = true;
-    clearTimeout(refreshTimer);
-    refreshTimer = setTimeout(flushRefresh, 100);
-    return;
-  }
-  render();
+  renderWhenReleased();
 }
 
 function scheduleRefresh(part) {
@@ -252,6 +274,16 @@ let pointerDownAt = 0;
 let renderDeferred = false;
 
 const pointerHeld = () => pointerDownAt !== 0 && Date.now() - pointerDownAt < 2000;
+
+function renderWhenReleased() {
+  if (pointerHeld()) {
+    renderDeferred = true;
+    clearTimeout(refreshTimer);
+    refreshTimer = setTimeout(flushRefresh, 100);
+    return;
+  }
+  render();
+}
 
 function flushRefresh() {
   if (pointerHeld()) {
@@ -319,6 +351,15 @@ async function loadArchiveState() {
   }
 }
 
+async function loadCustomGroups() {
+  try {
+    state.customGroups = await loadGroups();
+  } catch (error) {
+    console.error('Tab Overview: failed to read custom groups', error);
+  }
+  state.groupRules = compileCustomGroups(state.customGroups);
+}
+
 async function readOpenWindows() {
   const [windows, groups, selfTab] = await Promise.all([
     chrome.windows.getAll({ populate: true }),
@@ -343,6 +384,7 @@ async function readOpenWindows() {
       return {
         id: win.id,
         title,
+        number: index + 1,
         focused: win.focused,
         incognito: win.incognito,
         badge: { text: `W${index + 1}`, title },
@@ -444,8 +486,11 @@ function bindEvents() {
     if (areaName === 'session' && keys.some((key) => key.startsWith(OPENED_AT_PREFIX))) {
       reload();
     }
-    if (areaName === 'local' && ARCHIVE_AVAILABLE && keys.some(isBatchKey)) {
+    if (areaName === 'local' && EXTENSION_STORAGE && keys.some(isBatchKey)) {
       scheduleRefresh('archive');
+    }
+    if (areaName === 'local' && EXTENSION_STORAGE && keys.includes(GROUPS_KEY)) {
+      scheduleRefresh('groups');
     }
   });
 }
@@ -453,6 +498,7 @@ function bindEvents() {
 function bindSearch() {
   els.search.addEventListener('input', () => {
     state.query = els.search.value;
+    if (state.query.trim()) openEditor = null;
     render();
   });
 
@@ -474,6 +520,24 @@ function bindSearch() {
 
   document.addEventListener('keydown', (event) => {
     if (event.defaultPrevented) return;
+
+    if (event.key === 'Escape' && state.menu) {
+      event.preventDefault();
+      closeMenu({ focusButton: true });
+      return;
+    }
+
+    if (event.key === 'Escape' && openEditor?.confirmingDelete) {
+      event.preventDefault();
+      cancelGroupDelete();
+      return;
+    }
+
+    if (event.key === 'Escape' && openEditor) {
+      event.preventDefault();
+      closeGroupEditor({ focusButton: true });
+      return;
+    }
 
     if (event.key === 'Escape' && state.prompt?.kind === 'confirm') {
       event.preventDefault();
@@ -538,18 +602,30 @@ function applyViewButtons() {
   for (const button of els.sourceButtons) {
     const active = button.dataset.source === state.source;
     button.classList.toggle('is-active', active);
-    button.setAttribute('aria-pressed', String(active));
+    button.setAttribute('aria-selected', String(active));
+    button.tabIndex = active ? 0 : -1;
   }
 }
 
 function bindArchiveControls() {
-  els.sourceSwitch.hidden = !ARCHIVE_AVAILABLE;
-  if (!ARCHIVE_AVAILABLE) return;
+  els.sourceSwitch.hidden = !EXTENSION_STORAGE;
+  if (!EXTENSION_STORAGE) return;
 
   for (const button of els.sourceButtons) {
     button.addEventListener('click', () => switchSource(button.dataset.source));
   }
-  els.archiveAll.addEventListener('click', promptArchiveAll);
+  els.sourceSwitch.addEventListener('keydown', (event) => {
+    if (event.altKey || event.metaKey || event.ctrlKey) return;
+    const buttons = [...els.sourceButtons];
+    const current = buttons.findIndex((button) => button.dataset.source === state.source);
+    const index = { ArrowLeft: current - 1, ArrowRight: current + 1, Home: 0, End: buttons.length - 1 }[event.key];
+    if (index === undefined) return;
+    event.preventDefault();
+    const next = buttons[(index + buttons.length) % buttons.length];
+    switchSource(next.dataset.source);
+    next.focus();
+  });
+  els.archiveAll.addEventListener('click', () => promptArchive(ALL_TABS, '#archive-all'));
   els.archiveExport.addEventListener('click', downloadArchive);
   els.archiveImport.addEventListener('click', () => els.archiveImportFile.click());
   els.archiveImportFile.addEventListener('change', () => {
@@ -563,6 +639,7 @@ function switchSource(source) {
   if (!SOURCE_NAMES.has(source) || source === state.source) return;
   state.source = source;
   state.confirmDeleteBatchId = null;
+  state.menu = null;
   saveValue(SOURCE_KEY, source);
   applyViewButtons();
   render();
@@ -584,9 +661,40 @@ function render() {
     return;
   }
 
-  els.overview.replaceChildren();
+  clearOverview();
   renderSource(ctx);
+  finishOverview();
+  // The menu's tab closed or left this view.
+  if (state.menu && !els.overview.querySelector('.tab-menu')) state.menu = null;
   restoreFocus(focus);
+}
+
+// The open group editor's section stays in the page across renders, and the
+// rest of the overview is rebuilt around it. Moving or rebuilding it would
+// drop focus and the field being typed in, and the button under a click that
+// started a save.
+let mountBefore = null;
+
+function clearOverview() {
+  const kept = openEditor?.section.parentNode === els.overview ? openEditor.section : null;
+  for (const child of [...els.overview.children]) {
+    if (child !== kept) child.remove();
+  }
+  mountBefore = kept;
+}
+
+function mount(node) {
+  if (node === mountBefore) {
+    mountBefore = null;
+    return;
+  }
+  els.overview.insertBefore(node, mountBefore);
+}
+
+function finishOverview() {
+  mountBefore?.remove();
+  mountBefore = null;
+  if (openEditor && !openEditor.section.isConnected) openEditor = null;
 }
 
 function sourceContext(source) {
@@ -609,8 +717,10 @@ function renderSource(ctx) {
   const totalTabs = windows.reduce((sum, win) => sum + win.tabs.length, 0);
 
   if (totalTabs === 0) {
-    els.overview.append(createEmptyState(ctx.empty));
+    mount(createEmptyState(ctx.empty));
     els.summary.textContent = plural(0, ctx.tabNoun);
+    // Custom groups stay listed so they can still be made and edited.
+    if (state.view === 'sorted' && !ctx.query) renderSortedView(windows, ctx);
     return;
   }
 
@@ -630,10 +740,11 @@ function renderSource(ctx) {
 }
 
 function renderControls() {
-  if (!ARCHIVE_AVAILABLE) return;
+  if (!EXTENSION_STORAGE) return;
   const busy = isBusy();
   const archived = state.batches.reduce((sum, batch) => sum + batch.tabCount, 0);
   els.archiveCount.textContent = String(archived);
+  els.openCount.textContent = String(state.windows.reduce((sum, win) => sum + win.tabs.length, 0));
 
   const count = planArchive(state.windows).count;
   els.archiveAll.hidden = state.source !== 'open';
@@ -642,8 +753,11 @@ function renderControls() {
     ? 'No tabs to archive'
     : `Save ${plural(count, 'tab')} to the archive and close them`;
 
-  els.archiveTools.hidden = state.source !== 'archive';
-  els.archiveExport.disabled = busy || archived === 0;
+  els.groupsAdd.hidden = state.view !== 'sorted';
+  els.groupsAdd.disabled = busy;
+  els.archiveExport.hidden = state.source !== 'archive';
+  els.archiveImport.hidden = state.source !== 'archive';
+  els.archiveExport.disabled = busy || (archived === 0 && state.customGroups.length === 0);
   els.archiveImport.disabled = busy;
 
   els.footerHint.textContent = state.source === 'archive'
@@ -654,14 +768,15 @@ function renderControls() {
 // The confirm prompt recounts on every render, so tabs opened or closed while
 // it is showing are reflected before the user confirms.
 const BANNERS = {
-  confirm: () => {
-    const plan = planArchive(state.windows);
+  confirm: (prompt) => {
+    const plan = planArchive(scopeWindows(state.windows, prompt.scope));
     if (plan.count === 0) return null;
+    const where = prompt.scope.name ? ` in ${prompt.scope.name}` : '';
     return {
-      text: `Archive and close ${plural(plan.count, 'tab')}?`,
+      text: `Archive and close ${plural(plan.count, 'tab')}${where}?`,
       detail: leftOpenText(plan.skipped, 'stay open'),
       buttons: [
-      { id: 'archive-confirm', label: 'Archive and close', primary: true, onClick: confirmArchiveAll },
+      { id: 'archive-confirm', label: 'Archive and close', primary: true, onClick: confirmArchive },
         { id: 'archive-cancel', label: 'Cancel', onClick: dismissPrompt },
       ],
     };
@@ -671,9 +786,30 @@ const BANNERS = {
     text: prompt.text,
     detail: prompt.detail,
     tone: prompt.tone,
-    buttons: [{ id: 'banner-dismiss', label: 'Dismiss', onClick: dismissPrompt }],
+    buttons: [
+      ...(prompt.batchId
+        ? [{ id: 'banner-view-archive', label: 'View in archive', onClick: () => viewArchivedBatch(prompt.batchId) }]
+        : []),
+      { id: 'banner-dismiss', label: 'Dismiss', onClick: dismissPrompt },
+    ],
   }),
 };
+
+const SCOPE_MATCHERS = {
+  all: () => () => true,
+  window: (scope) => (tab, win) => win.id === scope.id,
+  group: (scope) => (tab) => tab.groupId === scope.id,
+  category: (scope) => (tab) => categorizeTab(tab, state.groupRules).id === scope.id,
+};
+
+const ALL_TABS = { kind: 'all', id: null, name: '', label: '' };
+
+function scopeWindows(windows, scope) {
+  const includes = SCOPE_MATCHERS[scope.kind](scope);
+  return windows.map((win) => ({ ...win, tabs: win.tabs.filter((tab) => includes(tab, win)) }));
+}
+
+const archivableCount = (tabs) => tabs.filter((tab) => !skipReason(tab)).length;
 
 function renderBanner() {
   const view = state.prompt && BANNERS[state.prompt.kind](state.prompt);
@@ -712,9 +848,15 @@ function renderBanner() {
 
 function dismissPrompt() {
   if (isBusy()) return;
+  const returnFocus = state.prompt?.returnFocus;
   state.prompt = null;
   render();
-  focusFirst(['#archive-all:not([hidden]):not(:disabled)', '#search']);
+  const target = returnFocus && document.querySelector(returnFocus);
+  if (target) {
+    target.focus();
+  } else {
+    focusFirst(['#archive-all:not([hidden]):not(:disabled)', '#search']);
+  }
 }
 
 function focusFirst(selectors) {
@@ -761,7 +903,7 @@ function renderBatchesView(ctx) {
     if (count === 0) continue;
     matched += count;
     groups += countGroups(batch.windows);
-    els.overview.append(renderBatch(batch, sections, count, ctx));
+    mount(renderBatch(batch, sections, count, ctx));
   }
 
   return { matched, detail: plural(groups, 'group') };
@@ -776,7 +918,7 @@ function renderBatch(batch, sections, count, ctx) {
   const tabs = count === batch.tabCount
     ? plural(count, 'tab')
     : `${count} of ${plural(batch.tabCount, 'tab')}`;
-  heading.textContent = `${formatDate(batch.archivedAt)} · ${tabs}`;
+  heading.textContent = [formatDate(batch.archivedAt), batch.label, tabs].filter(Boolean).join(' · ');
   heading.title = `Archived ${new Date(batch.archivedAt).toLocaleString()}`;
 
   const actions = el('div', 'batch-actions');
@@ -818,7 +960,7 @@ function cancelBatchDelete(batchId) {
 function renderWindowView(ctx) {
   const { sections, matched } = filterWindows(state.windows, ctx.query);
   for (const section of sections) {
-    els.overview.append(renderWindow(section, ctx));
+    mount(renderWindow(section, ctx));
   }
   return { matched, detail: plural(countGroups(state.windows), 'group') };
 }
@@ -841,16 +983,16 @@ function filterWindows(windows, query) {
 function renderSortedView(windows, ctx) {
   const categories = buildCategories(windows, ctx.query);
   for (const bucket of categories) {
-    els.overview.append(renderCategory(bucket, ctx));
+    mount(renderCategory(bucket, ctx));
   }
   return {
     matched: categories.reduce((sum, bucket) => sum + bucket.tabs.length, 0),
-    detail: plural(categories.length, 'category', 'categories'),
+    detail: plural(categories.filter((bucket) => bucket.tabs.length > 0).length, 'category', 'categories'),
   };
 }
 
 function renderEmptySearch(totalTabs, ctx) {
-  els.overview.append(createEmptyState({
+  mount(createEmptyState({
     icon: ICONS.search,
     title: `No ${ctx.tabNoun}s match “${state.query.trim()}”`,
     message: 'Try a shorter search, or search by site address.',
@@ -860,7 +1002,10 @@ function renderEmptySearch(totalTabs, ctx) {
   els.summary.textContent = matchSummary(0, totalTabs, ctx.tabNoun);
 }
 
-const FOCUS_SCOPES = ['data-tab-id', 'data-group-id', 'data-category-id', 'data-batch-id'];
+const FOCUS_KEYS = ['data-group-id', 'data-color'];
+const FOCUS_SCOPES = [
+  'data-tab-id', 'data-custom-group-id', 'data-group-id', 'data-category-id', 'data-batch-id', 'data-window-id',
+];
 
 // Every render rebuilds the overview, so focus is remembered as a selector and
 // put back on the equivalent new element.
@@ -875,7 +1020,10 @@ function focusKey() {
     const base = `[${attr}="${CSS.escape(scope.getAttribute(attr))}"]`;
     if (scope === active) return base;
     const classes = [...active.classList].map((name) => `.${CSS.escape(name)}`).join('');
-    return classes ? `${base} ${classes}` : null;
+    // Siblings that share classes, like menu items, tell apart by their key.
+    const keys = FOCUS_KEYS.filter((key) => active.hasAttribute(key))
+      .map((key) => `[${key}="${CSS.escape(active.getAttribute(key))}"]`).join('');
+    return classes ? `${base} ${classes}${keys}` : null;
   }
   return null;
 }
@@ -886,35 +1034,35 @@ function restoreFocus(key) {
   if (target && target !== document.activeElement) target.focus({ preventScroll: true });
 }
 
+const emptyBucket = (meta) => ({ meta, tabs: [], archivable: 0, windows: new Set() });
+
 function buildCategories(windows, query) {
-  const buckets = new Map();
+  // Without a search, every custom group gets a section, so a group with no
+  // tabs yet can be found and edited.
+  const buckets = new Map(query ? [] : state.groupRules.categories.map((meta) => [meta.id, emptyBucket(meta)]));
 
   for (const win of windows) {
     const groupTitles = new Map(win.groups.map((group) => [group.id, group.title]));
 
     for (const tab of win.tabs) {
-      const category = categorizeTab(tab);
-      const categoryMatches = category.label.toLowerCase().includes(query);
+      const category = categorizeTab(tab, state.groupRules);
+      if (!buckets.has(category.id)) buckets.set(category.id, emptyBucket(category));
+      const bucket = buckets.get(category.id);
+      // A section archive takes the whole category, matched by search or not.
+      if (!skipReason(tab)) bucket.archivable += 1;
 
+      const categoryMatches = category.label.toLowerCase().includes(query);
       if (query && !categoryMatches && !tabMatchesQuery(tab, groupTitles.get(tab.groupId), query)) continue;
 
-      if (!buckets.has(category.id)) {
-        buckets.set(category.id, {
-          meta: category,
-          tabs: [],
-          windows: new Set(),
-        });
-      }
-
-      const bucket = buckets.get(category.id);
       bucket.tabs.push({ tab, win });
       bucket.windows.add(win.id);
     }
   }
 
-  return [...buckets.values()].sort(
-    (a, b) => (CATEGORY_INDEX.get(a.meta.id) ?? 99) - (CATEGORY_INDEX.get(b.meta.id) ?? 99),
-  );
+  const rank = (meta) => (meta.custom ? meta.order : state.customGroups.length + CATEGORY_INDEX.get(meta.id));
+  return [...buckets.values()]
+    .filter((bucket) => bucket.tabs.length > 0 || (bucket.meta.custom && !query))
+    .sort((a, b) => rank(a.meta) - rank(b.meta));
 }
 
 function tabMatchesQuery(tab, groupTitle, query) {
@@ -923,9 +1071,16 @@ function tabMatchesQuery(tab, groupTitle, query) {
     (groupTitle || '').toLowerCase().includes(query);
 }
 
-function renderCategory({ meta, tabs }, ctx) {
-  const section = el('section', 'category');
-  section.dataset.category = meta.id;
+function renderCategory({ meta, tabs, archivable }, ctx) {
+  const editor = meta.custom && openEditor?.id === meta.groupId ? openEditor : null;
+  const section = editor?.section ?? el('section');
+  for (const child of [...section.children]) {
+    if (child !== editor?.item) child.remove();
+  }
+  section.className = 'category';
+  section.dataset.category = meta.custom ? 'custom' : meta.id;
+  if (meta.custom) section.dataset.color = meta.color;
+  if (tabs.length === 0) section.classList.add('is-empty');
 
   const isCollapsed = ctx.query === '' && state.collapsedCategories.has(meta.id);
   if (isCollapsed) section.classList.add('is-collapsed');
@@ -933,7 +1088,6 @@ function renderCategory({ meta, tabs }, ctx) {
   const header = document.createElement('button');
   header.type = 'button';
   header.className = 'group-header category-header';
-  header.dataset.categoryId = meta.id;
   header.setAttribute('aria-expanded', String(!isCollapsed));
   header.setAttribute('aria-label', `${meta.label}, ${plural(tabs.length, 'tab')}`);
 
@@ -948,17 +1102,63 @@ function renderCategory({ meta, tabs }, ctx) {
 
   header.append(chevron, dot, name, count);
   header.addEventListener('click', () => toggleCategory(meta.id));
-  section.append(header);
+  section.prepend(headerRow('categoryId', meta.id, header,
+    meta.custom ? editGroupButton(meta) : null,
+    sectionArchiveButton(ctx, { kind: 'category', id: meta.id, name: meta.label, label: meta.label },
+      archivable, 'category-archive', `[data-category-id="${CSS.escape(meta.id)}"] .category-archive`)));
+  if (editor) updateGroupEditor(editor, state.customGroups[meta.order], meta.order);
 
-  if (!isCollapsed) {
-    const grid = el('div', 'group-tabs');
-    for (const { tab, win } of tabs) {
-      grid.append(renderTab(tab, ctx, { windowBadge: win.badge }));
-    }
-    section.append(grid);
+  if (isCollapsed) return section;
+  if (tabs.length === 0) {
+    const note = el('p', 'category-empty');
+    note.textContent = 'No tabs yet. Add domains, or use a tab’s ⋯ menu.';
+    section.append(note);
+    return section;
   }
-
+  const grid = el('div', 'group-tabs');
+  for (const { tab, win } of tabs) {
+    grid.append(renderTab(tab, ctx, { windowBadge: win.badge }));
+  }
+  section.append(grid);
   return section;
+}
+
+// The header is a toggle button, so the section's other controls sit beside
+// it in a row that carries the focus scope for all of them.
+function headerRow(scopeKey, scopeId, header, ...controls) {
+  const row = el('div', 'group-header-row');
+  row.dataset[scopeKey] = String(scopeId);
+  row.append(header, ...controls.filter(Boolean));
+  return row;
+}
+
+function editGroupButton(meta) {
+  const open = openEditor?.id === meta.groupId;
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.className = 'section-edit category-edit';
+  button.title = `Edit ${meta.label}`;
+  button.setAttribute('aria-label', `Edit ${meta.label}`);
+  button.setAttribute('aria-expanded', String(open));
+  button.append(createIcon(ICONS.pencil));
+  button.addEventListener('click', () => (open
+    ? closeGroupEditor({ focusButton: true })
+    : openGroupEditor(meta.groupId)));
+  return button;
+}
+
+function sectionArchiveButton(ctx, scope, count, className, returnFocus) {
+  if (!ctx.actions.archiveSection || count === 0) return null;
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.className = `section-archive ${className}`;
+  const label = `Archive ${plural(count, 'tab')} in ${scope.name}`;
+  button.title = label;
+  button.setAttribute('aria-label', label);
+  button.disabled = isBusy();
+  button.append(createIcon(ICONS.archive));
+  button.addEventListener('click', () => ctx.actions.archiveSection(scope, returnFocus));
+  return button;
 }
 
 function toggleCategory(categoryId) {
@@ -988,6 +1188,7 @@ function filterWindow(win, query) {
 
 function renderWindow({ win, groups, ungrouped, count }, ctx) {
   const section = el('section', 'window');
+  section.dataset.windowId = String(win.id);
   if (win.focused) section.classList.add('is-focused');
 
   const head = el('div', 'window-head');
@@ -1017,18 +1218,24 @@ function renderWindow({ win, groups, ungrouped, count }, ctx) {
     meta.append(groupCount);
   }
 
+  const archive = sectionArchiveButton(ctx, {
+    kind: 'window', id: win.id, name: win.focused ? 'the current window' : win.title, label: `Window ${win.number}`,
+  }, archivableCount(win.tabs), 'window-archive', `[data-window-id="${win.id}"] .window-archive`);
+  if (archive) meta.append(archive);
+
   head.append(titleWrap, meta);
   section.append(head);
 
+  const fullGroups = new Map(win.groups.map((group) => [group.id, group]));
   const body = el('div', 'window-body');
-  for (const group of groups) body.append(renderGroup(group, ctx));
+  for (const group of groups) body.append(renderGroup(group, ctx, fullGroups.get(group.id).tabs));
   if (ungrouped.length > 0) body.append(renderUngrouped(ungrouped, groups.length > 0, ctx));
   section.append(body);
 
   return section;
 }
 
-function renderGroup(group, ctx) {
+function renderGroup(group, ctx, allTabs) {
   const section = el('section', 'group');
   const color = GROUP_COLORS.has(group.color) ? group.color : 'grey';
   section.dataset.color = color;
@@ -1039,7 +1246,6 @@ function renderGroup(group, ctx) {
   const header = document.createElement('button');
   header.type = 'button';
   header.className = 'group-header';
-  header.dataset.groupId = String(group.id);
   header.setAttribute('aria-expanded', String(!isCollapsed));
   header.setAttribute(
     'aria-label',
@@ -1057,7 +1263,10 @@ function renderGroup(group, ctx) {
 
   header.append(chevron, dot, name, count);
   header.addEventListener('click', () => toggleGroup(ctx, group.id));
-  section.append(header);
+  const groupName = group.title || 'Untitled group';
+  section.append(headerRow('groupId', group.id, header, sectionArchiveButton(ctx,
+    { kind: 'group', id: group.id, name: groupName, label: groupName },
+    archivableCount(allTabs), 'group-archive', `[data-group-id="${CSS.escape(String(group.id))}"] .group-archive`)));
 
   if (!isCollapsed) {
     const tabs = el('div', 'group-tabs');
@@ -1174,6 +1383,8 @@ function renderTab(tab, ctx, options = {}) {
   close.addEventListener('click', () => actions.dismiss(tab));
 
   card.append(main, close);
+  const host = groupableHost(tab.url);
+  if (host && EXTENSION_STORAGE) appendTabMenu(card, `${ctx.source}:${tab.id}`, tab.id, host, tab.url);
   if (actions.middleClick) {
     card.addEventListener('auxclick', (event) => {
       if (event.button === 1) {
@@ -1330,24 +1541,25 @@ async function closeTab(tab) {
   }
 }
 
-function promptArchiveAll() {
+function promptArchive(scope = ALL_TABS, returnFocus = '') {
   if (isBusy()) return;
-  if (planArchive(state.windows).count === 0) return;
-  state.prompt = { kind: 'confirm' };
+  if (planArchive(scopeWindows(state.windows, scope)).count === 0) return;
+  state.prompt = { kind: 'confirm', scope, returnFocus };
   render();
   document.getElementById('archive-confirm')?.focus();
 }
 
-async function confirmArchiveAll() {
-  if (isBusy()) return;
+async function confirmArchive() {
+  if (isBusy() || state.prompt?.kind !== 'confirm') return;
+  const { scope } = state.prompt;
   state.prompt = { kind: 'busy', text: 'Archiving tabs…' };
   render();
 
   let result;
   try {
     // Re-read so tabs opened or closed since the confirmation are accounted for.
-    const plan = planArchive(await readOpenWindows());
-    const { archived, closeFailed } = await archivePlan(plan);
+    const plan = planArchive(scopeWindows(await readOpenWindows(), scope));
+    const { archived, closeFailed, batchId } = await archivePlan(plan, scope.label);
     const notes = [leftOpenText(plan.skipped, 'left open')];
     if (closeFailed > 0) {
       notes.push(`${plural(closeFailed, 'archived tab')} changed or could not be closed and ` +
@@ -1355,14 +1567,16 @@ async function confirmArchiveAll() {
     }
     result = {
       kind: 'result',
-      text: `Archived ${plural(archived, 'tab')}`,
+      text: `Archived ${plural(archived, 'tab')}${scope.name ? ` from ${scope.name}` : ''}`,
       detail: notes.filter(Boolean).join(' '),
       tone: closeFailed > 0 ? 'warn' : '',
     };
-    if (archived > 0) {
+    if (archived > 0 && scope.kind === 'all') {
       state.source = 'archive';
       saveValue(SOURCE_KEY, 'archive');
       applyViewButtons();
+    } else if (archived > 0) {
+      result.batchId = batchId;
     }
   } catch (error) {
     console.error('Tab Overview: archive failed', error);
@@ -1377,6 +1591,13 @@ async function confirmArchiveAll() {
   state.prompt = result;
   await refresh();
   focusFirst(['#banner-dismiss']);
+}
+
+function viewArchivedBatch(batchId) {
+  state.prompt = null;
+  switchSource('archive');
+  render();
+  focusFirst([`[data-batch-id="${CSS.escape(batchId)}"] .batch-restore`, '#search']);
 }
 
 async function restoreArchivedBatch(batch) {
@@ -1470,13 +1691,16 @@ async function importArchiveFile(file) {
   if (isBusy()) return;
   let result;
   try {
-    const { batches, tabs, skipped, invalid } = await importArchive(await file.text());
+    const { batches, tabs, skipped, invalid, groups, groupsSkipped, groupsInvalid } =
+      await importArchive(await file.text());
     const notes = [];
     if (skipped > 0) notes.push(`${plural(skipped, 'batch', 'batches')} already in the archive were skipped.`);
     if (invalid > 0) notes.push(`${plural(invalid, 'batch', 'batches')} had no tabs that can be reopened.`);
+    if (groupsSkipped > 0) notes.push(`Skipped ${plural(groupsSkipped, 'group')} you already have.`);
+    if (groupsInvalid > 0) notes.push(`${plural(groupsInvalid, 'group')} without a valid id ${groupsInvalid === 1 ? 'was' : 'were'} left out.`);
     result = {
       kind: 'result',
-      text: `Imported ${plural(batches, 'batch', 'batches')}, ${plural(tabs, 'tab')}`,
+      text: `Imported ${plural(batches, 'batch', 'batches')}, ${plural(tabs, 'tab')}, ${plural(groups, 'group')}`,
       detail: notes.join(' '),
       tone: '',
     };
@@ -1484,7 +1708,356 @@ async function importArchiveFile(file) {
     result = { kind: 'result', text: 'Nothing was imported', detail: error?.message || '', tone: 'error' };
   }
   state.prompt = result;
-  await refresh(['archive']);
+  await refresh(['archive', 'groups']);
+}
+
+/* ----------------------------------------------------------- custom groups */
+
+function groupableHost(url) {
+  try {
+    const parsed = new URL(url);
+    return /^https?:$/.test(parsed.protocol) ? normalizeDomain(parsed.hostname) : null;
+  } catch {
+    return null;
+  }
+}
+
+function bindCustomGroups() {
+  if (!EXTENSION_STORAGE) return;
+  els.groupsAdd.addEventListener('click', addGroup);
+  // mousedown, not click: closing must not rebuild the page under a click
+  // that is about to land on another card.
+  document.addEventListener('mousedown', (event) => {
+    if (state.menu && !event.target.closest?.('.tab-menu, .tab-menu-button')) closeMenu();
+  });
+}
+
+// Mutations resolve with the stored groups, so the page updates even when
+// storage reports no change (a save that normalized to the same value).
+async function changeGroups(change) {
+  try {
+    const groups = await change();
+    state.customGroups = groups;
+    state.groupRules = compileCustomGroups(groups);
+    // A save often starts with the mousedown that blurs a field; rendering
+    // before the mouseup would replace the button being clicked.
+    renderWhenReleased();
+    return groups;
+  } catch (error) {
+    console.error('Tab Overview: could not save custom groups', error);
+    state.prompt = { kind: 'result', text: 'Could not save your custom groups', detail: error?.message || '', tone: 'error' };
+    render();
+    return null;
+  }
+}
+
+const groupOf = (host) => state.customGroups.find((group) => group.domains.includes(host));
+const menuButtonSelector = (tabId) => `[data-tab-id="${CSS.escape(String(tabId))}"] .tab-menu-button`;
+
+function appendTabMenu(card, key, tabId, host, url) {
+  const open = state.menu?.key === key;
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.className = 'tab-menu-button';
+  button.title = 'Custom group';
+  button.setAttribute('aria-label', `Put ${host} in a custom group`);
+  button.setAttribute('aria-haspopup', 'true');
+  button.setAttribute('aria-expanded', String(open));
+  button.append(createIcon(ICONS.more));
+  button.addEventListener('click', () => toggleMenu({ key, tabId, host }));
+  card.append(button);
+
+  if (!open) return;
+  card.classList.add('has-menu');
+  card.append(renderTabMenu(host, url));
+}
+
+function renderTabMenu(host, url) {
+  const menu = el('div', 'tab-menu');
+  menu.setAttribute('role', 'group');
+  menu.setAttribute('aria-label', `Custom group for ${host}`);
+  menu.addEventListener('auxclick', (event) => event.stopPropagation());
+
+  const title = el('div', 'tab-menu-title');
+  title.textContent = `Put ${host} in…`;
+  menu.append(title);
+
+  const current = groupOf(host);
+  const matched = current ? null : matchCustomDomain(url, state.groupRules);
+  if (matched) {
+    const note = el('div', 'tab-menu-current');
+    note.textContent = `In ${matched.category.label} through ${matched.entry}`;
+    menu.append(note);
+  }
+  for (const group of state.customGroups) {
+    const item = menuItem(group.label, () => changeGroups(() => assignDomain(host, group.id))
+      .then(() => closeMenu({ focusButton: true })), 'tab-menu-group');
+    item.dataset.groupId = group.id;
+    const dot = el('span', 'tab-menu-dot');
+    dot.dataset.color = group.color;
+    item.prepend(dot);
+    if (group === current || group.id === matched?.category.groupId) {
+      item.disabled = true;
+      item.setAttribute('aria-current', 'true');
+      item.title = current ? `${host} is in ${group.label}` : `In ${group.label} through ${matched.entry}`;
+    }
+    menu.append(item);
+  }
+
+  if (state.menu.naming) {
+    const row = el('div', 'tab-menu-naming');
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.className = 'tab-menu-input';
+    input.placeholder = 'Group name';
+    input.setAttribute('aria-label', 'New group name');
+    input.maxLength = 80;
+    input.value = state.menu.draft;
+    input.addEventListener('input', () => { state.menu.draft = input.value; });
+    input.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter') {
+        event.preventDefault();
+        createGroupFromMenu(host);
+      } else if (event.key === 'Escape') {
+        event.preventDefault();
+        state.menu.naming = false;
+        render();
+        document.querySelector('.tab-menu .tab-menu-new')?.focus();
+      }
+    });
+    row.append(input, menuItem('Create', () => createGroupFromMenu(host), 'tab-menu-create'));
+    menu.append(row);
+  } else {
+    menu.append(menuItem('New group…', () => {
+      state.menu.naming = true;
+      render();
+      document.querySelector('.tab-menu .tab-menu-input')?.focus();
+    }, 'tab-menu-new'));
+  }
+
+  if (current) {
+    menu.append(el('div', 'tab-menu-divider'));
+    menu.append(menuItem(`Remove from ${current.label}`, () => changeGroups(() => unassignDomain(host, current.id))
+      .then(() => closeMenu({ focusButton: true })), 'tab-menu-remove'));
+  }
+
+  return menu;
+}
+
+function menuItem(label, onClick, className) {
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.className = `tab-menu-item ${className}`;
+  const text = el('span', 'tab-menu-label');
+  text.textContent = label;
+  button.append(text);
+  button.addEventListener('click', onClick);
+  return button;
+}
+
+function toggleMenu(menu) {
+  if (state.menu?.key === menu.key) {
+    closeMenu({ focusButton: true });
+    return;
+  }
+  state.menu = { ...menu, naming: false, draft: '' };
+  render();
+  document.querySelector('.tab-menu .tab-menu-item:not(:disabled)')?.focus();
+}
+
+async function createGroupFromMenu(host) {
+  const label = state.menu?.draft.trim();
+  if (!label) {
+    document.querySelector('.tab-menu .tab-menu-input')?.focus();
+    return;
+  }
+  await changeGroups(() => createGroup({ label, domains: [host] }));
+  closeMenu({ focusButton: true });
+}
+
+// Takes the menu out of the page without a full render, so a click that
+// started outside the menu still reaches its target.
+function closeMenu({ focusButton = false } = {}) {
+  const tabId = state.menu?.tabId;
+  state.menu = null;
+  for (const node of document.querySelectorAll('.tab-menu')) node.remove();
+  for (const card of document.querySelectorAll('.tab.has-menu')) {
+    card.classList.remove('has-menu');
+    card.querySelector('.tab-menu-button')?.setAttribute('aria-expanded', 'false');
+  }
+  if (focusButton && tabId !== undefined) document.querySelector(menuButtonSelector(tabId))?.focus();
+}
+
+// null | GroupEditor: the one inline editor, in its group's Sorted section.
+// GroupEditor { id, section, item, confirmingDelete, ...its fields and buttons }
+let openEditor = null;
+
+function openGroupEditor(id, { select = false } = {}) {
+  // A search hides groups without matching tabs, so an edit could hide the
+  // group being edited, and a new group has no tabs at all.
+  state.query = '';
+  els.search.value = '';
+  openEditor = createGroupEditor(id);
+  render();
+  if (!openEditor) return;
+  openEditor.label.focus();
+  if (select) openEditor.label.select();
+}
+
+function closeGroupEditor({ focusButton = false } = {}) {
+  if (!openEditor) return;
+  const { id, item } = openEditor;
+  // Blurring commits a field that is still being typed in.
+  if (item.contains(document.activeElement)) document.activeElement.blur();
+  openEditor = null;
+  render();
+  if (focusButton) focusFirst([`[data-category-id="${CSS.escape(`custom:${id}`)}"] .category-edit`]);
+}
+
+function createGroupEditor(id) {
+  const save = (patch) => changeGroups(() => editGroup(id, patch));
+  const item = el('div', 'group-editor');
+  item.dataset.customGroupId = id;
+
+  const head = el('div', 'group-editor-head');
+  const label = document.createElement('input');
+  label.type = 'text';
+  label.className = 'group-edit-label';
+  label.maxLength = 80;
+  label.setAttribute('aria-label', 'Group name');
+  label.addEventListener('change', () => save({ label: label.value }));
+  label.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter') label.blur();
+  });
+
+  const colors = el('div', 'group-edit-color');
+  colors.setAttribute('role', 'group');
+  colors.setAttribute('aria-label', 'Color');
+  const swatches = [...GROUP_COLORS].map((color) => {
+    const swatch = document.createElement('button');
+    swatch.type = 'button';
+    swatch.className = 'color-swatch';
+    swatch.dataset.color = color;
+    swatch.title = color;
+    swatch.setAttribute('aria-label', color);
+    swatch.addEventListener('click', () => save({ color }));
+    return swatch;
+  });
+  colors.append(...swatches);
+
+  const actions = el('div', 'group-editor-actions');
+  const up = createButton('Move up', () => moveCustomGroup(id, -1), 'is-ghost group-move-up');
+  const down = createButton('Move down', () => moveCustomGroup(id, 1), 'is-ghost group-move-down');
+  const deleteButton = createButton('Delete group', () => {
+    openEditor.confirmingDelete = true;
+    render();
+    item.querySelector('.group-delete-cancel').focus();
+  }, 'is-ghost group-delete');
+  const done = createButton('Done', () => closeGroupEditor({ focusButton: true }), 'group-edit-done');
+  actions.append(up, down, deleteButton, done);
+
+  const confirm = el('div', 'group-editor-actions group-delete-prompt');
+  const question = el('span', 'group-delete-question');
+  confirm.append(
+    question,
+    createButton('Delete', () => {
+      openEditor.confirmingDelete = false;
+      changeGroups(() => deleteGroup(id)).then(() => focusFirst(['#groups-add']));
+    }, 'is-danger group-delete-confirm'),
+    createButton('Cancel', cancelGroupDelete, 'group-delete-cancel'),
+  );
+
+  head.append(label, colors, actions, confirm);
+
+  const domains = listField('Domains · one per line', 'group-edit-domains', 'example.com\ngithub.com/your-org',
+    (lines) => save({ domains: lines }));
+  const keywords = listField('Keywords · optional', 'group-edit-keywords', 'invoice\nquarterly report',
+    (lines) => save({ keywords: lines }));
+  const fields = el('div', 'group-editor-fields');
+  fields.append(domains.wrap, keywords.wrap);
+  const hint = el('p', 'group-editor-hint');
+  hint.textContent = 'A domain also covers its subdomains; add a path, like github.com/your-org, to match ' +
+    'only part of a site. Keywords match whole words in the title or address. Fields save when you leave them.';
+
+  item.append(head, fields, hint);
+  const section = el('section');
+  section.append(item);
+  return {
+    id, section, item, confirmingDelete: false,
+    label, swatches, up, down, deleteButton, done, actions, confirm, question,
+    domains: domains.area, keywords: keywords.area,
+  };
+}
+
+// A focused field keeps what is being typed; it saves when it loses focus.
+function setFieldValue(field, value) {
+  if (field !== document.activeElement && field.value !== value) field.value = value;
+}
+
+function updateGroupEditor(editor, group, index) {
+  const busy = isBusy();
+  editor.item.dataset.color = group.color;
+  setFieldValue(editor.label, group.label);
+  setFieldValue(editor.domains, group.domains.join('\n'));
+  setFieldValue(editor.keywords, group.keywords.join('\n'));
+  editor.domains.rows = Math.min(8, Math.max(3, group.domains.length + 1));
+  editor.keywords.rows = Math.min(8, Math.max(3, group.keywords.length + 1));
+  for (const swatch of editor.swatches) {
+    swatch.setAttribute('aria-pressed', String(swatch.dataset.color === group.color));
+    swatch.disabled = busy;
+  }
+  editor.up.disabled = busy || index === 0;
+  editor.down.disabled = busy || index === state.customGroups.length - 1;
+  editor.deleteButton.disabled = busy;
+  editor.done.disabled = busy;
+  editor.up.setAttribute('aria-label', `Move ${group.label} up`);
+  editor.down.setAttribute('aria-label', `Move ${group.label} down`);
+
+  editor.actions.hidden = editor.confirmingDelete;
+  editor.confirm.hidden = !editor.confirmingDelete;
+  editor.question.textContent = `Delete ${group.label}?`;
+  for (const button of editor.confirm.querySelectorAll('button')) button.disabled = busy;
+}
+
+function listField(title, className, placeholder, save) {
+  const wrap = el('label', 'group-field');
+  const name = el('span', 'group-field-name');
+  name.textContent = title;
+  const area = document.createElement('textarea');
+  area.className = className;
+  area.spellcheck = false;
+  area.placeholder = placeholder;
+  area.addEventListener('change', () => save(area.value.split('\n')));
+  wrap.append(name, area);
+  return { wrap, area };
+}
+
+async function addGroup() {
+  if (isBusy()) return;
+  const groups = await changeGroups(() => createGroup({ label: 'New group' }));
+  const created = groups?.at(-1);
+  if (created) openGroupEditor(created.id, { select: true });
+}
+
+async function moveCustomGroup(id, offset) {
+  await changeGroups(() => moveGroup(id, offset));
+  const editor = `[data-custom-group-id="${CSS.escape(id)}"]`;
+  // The button just pressed is disabled once the group reaches the end of the list.
+  const active = document.activeElement;
+  if (!openEditor?.item.contains(active) || active.disabled) {
+    focusFirst([
+      `${editor} ${offset < 0 ? '.group-move-up' : '.group-move-down'}:not(:disabled)`,
+      `${editor} .group-move-up:not(:disabled)`,
+      `${editor} .group-move-down:not(:disabled)`,
+    ]);
+  }
+}
+
+function cancelGroupDelete() {
+  if (!openEditor) return;
+  openEditor.confirmingDelete = false;
+  render();
+  openEditor?.deleteButton.focus();
 }
 
 function toggleGroup(ctx, groupId) {

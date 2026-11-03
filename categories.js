@@ -428,16 +428,7 @@ function escapeRegExp(value) {
 }
 
 for (const category of CATEGORIES) {
-  if (category.keywords.length === 0) continue;
-  const body = category.keywords
-    .slice()
-    .sort((a, b) => b.length - a.length)
-    .map(escapeRegExp)
-    .join('|');
-  category.keywordPattern = new RegExp(
-    `(?:^|[^a-z0-9])(${body})(?![a-z0-9])`,
-    'g',
-  );
+  if (category.keywords.length > 0) category.keywordPattern = keywordPattern(category.keywords);
 }
 
 function hostnameOf(url) {
@@ -485,15 +476,82 @@ function findHostPatternCategory(url, hostname) {
   ) ?? null;
 }
 
+function keywordPattern(keywords) {
+  const body = keywords
+    .slice()
+    .sort((a, b) => b.length - a.length)
+    .map(escapeRegExp)
+    .join('|');
+  return new RegExp(`(?:^|[^a-z0-9])(${body})(?![a-z0-9])`, 'g');
+}
+
+const pathHasPrefix = (path, prefix) =>
+  prefix === '' || path === prefix || path.startsWith(`${prefix}/`);
+
+const NO_CUSTOM_GROUPS = { categories: [], domainRules: [], keywordRules: [] };
+
+/**
+ * Turns the user's custom groups into category objects and match rules. Domain
+ * rules are sorted most specific first: a path prefix beats a bare host, and a
+ * longer entry beats a shorter one, so the first matching rule wins.
+ */
+export function compileCustomGroups(groups) {
+  if (groups.length === 0) return NO_CUSTOM_GROUPS;
+
+  const categories = groups.map((group, order) => ({
+    id: `custom:${group.id}`,
+    groupId: group.id,
+    label: group.label,
+    color: group.color,
+    custom: true,
+    order,
+  }));
+
+  const domainRules = groups
+    .flatMap((group, order) => group.domains.map((entry) => {
+      const slash = entry.indexOf('/');
+      const host = slash === -1 ? entry : entry.slice(0, slash);
+      const path = slash === -1 ? '' : entry.slice(slash);
+      return { host, path, order, category: categories[order] };
+    }))
+    .sort((a, b) =>
+      Number(Boolean(b.path)) - Number(Boolean(a.path)) ||
+      (b.host.length + b.path.length) - (a.host.length + a.path.length) ||
+      a.order - b.order);
+
+  const keywordRules = groups
+    .map((group, order) => (group.keywords.length > 0
+      ? { pattern: keywordPattern(group.keywords), category: categories[order] }
+      : null))
+    .filter(Boolean);
+
+  return { categories, domainRules, keywordRules };
+}
+
 function countMatches(text, pattern) {
   if (!text) return 0;
   return (text.match(pattern) || []).length;
 }
 
-export function categorizeTab(tab) {
+/** The most specific custom domain rule for an address: { category, entry } or null. */
+export function matchCustomDomain(url, custom = NO_CUSTOM_GROUPS) {
+  const hostname = hostnameOf(url);
+  const path = pathOf(url);
+  const rule = custom.domainRules.find((r) => domainMatches(hostname, r.host) && pathHasPrefix(path, r.path));
+  return rule ? { category: rule.category, entry: rule.host + rule.path } : null;
+}
+
+export function categorizeTab(tab, custom = NO_CUSTOM_GROUPS) {
   const hostname = hostnameOf(tab.url);
   const title = (tab.title || '').toLowerCase();
   const path = pathOf(tab.url);
+
+  const domainRule = matchCustomDomain(tab.url, custom);
+  if (domainRule) return domainRule.category;
+  for (const rule of custom.keywordRules) {
+    if (countMatches(title, rule.pattern) > 0 || countMatches(path, rule.pattern) > 0) return rule.category;
+  }
+
   const scores = new Map();
 
   const domainCategory = findDomainCategory(hostname) ??

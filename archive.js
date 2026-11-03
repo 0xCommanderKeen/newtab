@@ -1,15 +1,19 @@
 'use strict';
 
+import { GROUP_COLORS, loadGroups, mergeGroups } from './custom-groups.js';
+
 // Each archive batch lives under its own storage.local key, so two overview
 // pages acting on different batches never overwrite each other.
 //
-// Stored batch  { id, archivedAt, windows: [StoredWindow] }
+// Stored batch  { id, archivedAt, label?, windows: [StoredWindow] }
+//               label names the section a batch was archived from, such as
+//               a tab group, window, or category; Archive all has none
 // StoredWindow  { id, title, groups: [StoredGroup], ungrouped: [StoredTab] }
 // StoredGroup   { id, title, color, tabs: [StoredTab] }
 // StoredTab     { id, title, url, favIconUrl? }   favIconUrl only as data: URL
 //
 // Batch in memory (what the overview renders):
-// ArchiveBatch  { id, archivedAt, tabCount, windows: [ArchiveWindow] }
+// ArchiveBatch  { id, archivedAt, label, tabCount, windows: [ArchiveWindow] }
 // ArchiveWindow { id, title, groups: [ArchiveGroup], ungrouped, tabs }
 //               tabs = every tab of the window, groups first, then ungrouped
 // ArchiveGroup  { id, title, color, tabs }
@@ -19,10 +23,7 @@ const BATCH_PREFIX = 'archive:batch:';
 const BACKUP_FORMAT = 'tab-overview-backup';
 const BACKUP_VERSION = 1;
 const MAX_ID_LENGTH = 200;
-
-export const GROUP_COLORS = new Set([
-  'grey', 'blue', 'red', 'yellow', 'green', 'pink', 'purple', 'cyan', 'orange',
-]);
+const MAX_LABEL_LENGTH = 120;
 
 export const isBatchKey = (key) => key.startsWith(BATCH_PREFIX);
 const keyOf = (batchId) => BATCH_PREFIX + batchId;
@@ -89,8 +90,8 @@ export function planArchive(windows) {
  * the write fails no tab is closed. A tab that navigated since it was read is
  * left open, because the archive holds its old address.
  */
-export async function archivePlan(plan) {
-  if (plan.count === 0) return { archived: 0, closeFailed: 0 };
+export async function archivePlan(plan, label = '') {
+  if (plan.count === 0) return { archived: 0, closeFailed: 0, batchId: null };
 
   const toStoredTab = (tab) => {
     const url = urlOf(tab);
@@ -102,6 +103,7 @@ export async function archivePlan(plan) {
   const batch = {
     id: crypto.randomUUID(),
     archivedAt: Date.now(),
+    ...(label.trim() ? { label: label.trim().slice(0, MAX_LABEL_LENGTH) } : {}),
     windows: plan.windows.map((win, index) => ({
       id: crypto.randomUUID(),
       title: `Window ${index + 1}`,
@@ -131,7 +133,7 @@ export async function archivePlan(plan) {
     .map((tab) => tab.id);
 
   const closeFailed = savedUrls.size - unchanged.length + await closeTabs(unchanged);
-  return { archived: plan.count, closeFailed };
+  return { archived: plan.count, closeFailed, batchId: batch.id };
 }
 
 async function closeTabs(ids) {
@@ -188,7 +190,13 @@ function toModel(batch) {
     };
   });
 
-  return { id: batch.id, archivedAt: batch.archivedAt, tabCount: countTabs(batch), windows };
+  return {
+    id: batch.id,
+    archivedAt: batch.archivedAt,
+    label: batch.label ?? '',
+    tabCount: countTabs(batch),
+    windows,
+  };
 }
 
 /* ------------------------------------------------------------- validation */
@@ -211,9 +219,11 @@ function normalizeBatch(raw, id, fallbackArchivedAt) {
     .filter(Boolean);
   if (windows.length === 0) return null;
 
+  const label = stringOr(raw.label, '').trim().slice(0, MAX_LABEL_LENGTH);
   return {
     id,
     archivedAt: Number.isFinite(raw.archivedAt) ? raw.archivedAt : fallbackArchivedAt,
+    ...(label ? { label } : {}),
     windows,
   };
 }
@@ -410,13 +420,15 @@ export async function exportArchive() {
     .map(([key, raw]) => normalizeBatch(raw, key.slice(BATCH_PREFIX.length), 0))
     .filter(Boolean)
     .sort((a, b) => b.archivedAt - a.archivedAt);
-  return { format: BACKUP_FORMAT, version: BACKUP_VERSION, exportedAt: Date.now(), archive };
+  const customGroups = await loadGroups();
+  return { format: BACKUP_FORMAT, version: BACKUP_VERSION, exportedAt: Date.now(), archive, customGroups };
 }
 
 /**
- * Adds the batches from a backup file. A batch whose id is already in the
- * archive is skipped, and a batch without an id gets one derived from its
- * content, so importing the same file twice changes nothing.
+ * Adds the batches and custom groups from a backup file. A batch or group
+ * whose id is already present is skipped, and a batch without an id gets one
+ * derived from its content, so importing the same file twice changes nothing.
+ * Backups written before custom groups existed have no customGroups field.
  */
 export async function importArchive(text) {
   let data;
@@ -436,7 +448,7 @@ export async function importArchive(text) {
   const taken = new Set(Object.keys(stored).filter(isBatchKey));
   const fallbackArchivedAt = Number.isFinite(data.exportedAt) ? data.exportedAt : Date.now();
   const additions = {};
-  const result = { batches: 0, tabs: 0, skipped: 0, invalid: 0 };
+  const result = { batches: 0, tabs: 0, skipped: 0, invalid: 0, groups: 0, groupsSkipped: 0 };
 
   for (const raw of data.archive) {
     const id = validId(raw?.id) ? raw.id : contentId(raw);
@@ -456,5 +468,9 @@ export async function importArchive(text) {
   }
 
   if (result.batches > 0) await chrome.storage.local.set(additions);
+  const { added, skipped, invalid } = await mergeGroups(data.customGroups);
+  result.groups = added;
+  result.groupsSkipped = skipped;
+  result.groupsInvalid = invalid;
   return result;
 }
