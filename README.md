@@ -95,6 +95,20 @@ The package is written to `web-ext-artifacts/`.
 - Collapse a category in the sorted view; the state is remembered locally.
 - The selected view and collapse choices persist across page loads.
 - Live updates as tabs are opened, closed, moved, grouped, or renamed.
+- **Suspend** closes a tab in the browser and keeps it on the **Open tabs**
+  page, dimmed, in its window and tab group. Use **Suspend tab** in a tab's ⋯
+  menu, or the suspend button beside a tab group, a window, or a Sorted view
+  category. The same tabs stay open as with **Archive all**: pinned tabs,
+  private-window tabs, and pages that can't be reopened later. A tab is closed
+  only after it was saved, and a tab that navigated in the meantime stays open.
+  Click a suspended tab to reopen it in place and switch to it, or remove it
+  with the × button. **Reopen N** on a section reopens its suspended tabs in the
+  background, unloaded where the browser allows it, in their tab groups.
+  Suspended tabs follow their group by title and color, because group and
+  window ids don't survive a restart. If neither their window nor their group is
+  open, they are listed under **Suspended from closed windows** and reopen into
+  the current window. Search and the Sorted view include them, and **Archive
+  all** and a section archive take them along.
 - **Archive all** closes every open tab and keeps it in the archive. Pinned
   tabs, private-window tabs, the overview itself, and pages that can't be
   reopened later (anything not `http:` or `https:`) stay open. A tab is closed
@@ -111,11 +125,12 @@ The package is written to `web-ext-artifacts/`.
 - Click an archived tab to reopen it, or remove it with the × button.
   **Restore** reopens a whole batch, one window per archived window, with its
   tab groups. In Firefox the restored tabs stay unloaded until you open them.
-- **Export**, in the archive toolbar, downloads the archive and your custom
-  groups as a JSON backup file. **Import** adds the batches and groups from a
-  backup and skips batches and groups that are already there. A group you
-  already have is kept as it is, not overwritten. Backups made before custom
-  groups existed still import.
+- **Export**, in the archive toolbar, downloads the archive, your custom
+  groups, and your suspended tabs as a JSON backup file. **Import** adds the
+  batches, groups, and suspended tabs from a backup and skips the ones that are
+  already there. A group you already have is kept as it is, not overwritten.
+  The `customGroups` and `suspended` fields are optional, so backups made
+  before they existed still import.
 - Automatic light and dark theme.
 
 ## How the sorted view categorizes tabs
@@ -169,17 +184,18 @@ The rules live in `categories.js`, so you can add domains or keywords there.
   requests are made to websites. This permission is Chrome-only. Firefox ignores
   it with a warning, and the page uses the `data:` favicon Firefox already
   provides for each tab, so Firefox makes no favicon requests to websites either.
-- `storage` — keep tab open timestamps in session storage, and the tab archive
-  and custom groups in the extension's local storage. Session data is cleared when the browser
+- `storage` — keep tab open timestamps in session storage, and the tab archive,
+  suspended tabs, and custom groups in the extension's local storage. Session data is cleared when the browser
   exits. Neither leaves the machine.
 - `unlimitedStorage` — let the archive grow past Chrome's 10 MB local storage
   quota. Archived favicons are stored as image data.
 
-The archive and custom groups live in the extension's local storage. Archive
-batches are stored under `archive:batch:<id>` keys, and custom groups as one
-ordered array under `customGroups`. Both survive browser restarts, and neither
-is synced. Removing the extension deletes them, so use **Export** to keep a
-backup file before you uninstall or reinstall it.
+The archive, custom groups, and suspended tabs live in the extension's local
+storage. Archive batches are stored under `archive:batch:<id>` keys, suspended
+tabs under `suspended:<id>` keys, and custom groups as one ordered array under
+`customGroups`. They survive browser restarts, and none of them is synced.
+Removing the extension deletes them, so use **Export** to keep a backup file
+before you uninstall or reinstall it.
 
 The background service worker records tab open times and removes them when tabs
 close. There are no analytics, no external requests, and no host permissions. The
@@ -207,9 +223,12 @@ is visible.
 - Firefox 140 or newer is required. Tab groups use Firefox's tab groups feature,
   which shipped in Firefox 139.
 - Pages without a favicon show a letter badge in both browsers.
-- Archived tabs keep their title, address, and (in Firefox) favicon. Page
-  state such as scroll position, form input, and back/forward history is not
-  kept.
+- Archived and suspended tabs keep their title, address, and (in Firefox)
+  favicon. Page state such as scroll position, form input, and back/forward
+  history is not kept.
+- After a browser restart a new window can get the id of an old one. Suspended
+  tabs saved with that id then show in the new window, not under **Suspended
+  from closed windows**. They still reopen there, in their tab group.
 - In the archive, a window's grouped tabs are listed before its ungrouped tabs,
   and a restored window opens them in that order.
 
@@ -223,7 +242,8 @@ custom-groups.js  Custom group storage, validation, and edits
 newtab.html       Page shell
 newtab.css        Light/dark responsive styling
 newtab.js         Data loading, rendering, search, views, and tab actions
-archive.js        Tab archive storage, archive all, restore, export, and import
+archive.js        Tab archive and suspended tab storage, archive all, restore, export, and import
+suspend.js        Suspended tab placement, suspending, and reopening
 icons/            Extension icons (SVG source + PNG sizes)
 screenshot.png    Window view preview
 screenshot-sorted.png  Sorted view preview
