@@ -28,13 +28,15 @@ const MAX_LABEL_LENGTH = 120;
 export const isBatchKey = (key) => key.startsWith(BATCH_PREFIX);
 const keyOf = (batchId) => BATCH_PREFIX + batchId;
 // While Chrome navigates, url is still the old page and pendingUrl the new one.
-const urlOf = (tab) => (isReopenable(tab.pendingUrl) ? tab.pendingUrl : tab.url || tab.pendingUrl || '');
+export const urlOf = (tab) => (isReopenable(tab.pendingUrl) ? tab.pendingUrl : tab.url || tab.pendingUrl || '');
 
-// Every overview page shares the extension's origin, so a Web Lock per batch
-// serializes read-modify-write on that batch across pages.
-function withBatchLock(batchId, task) {
-  return globalThis.navigator?.locks ? navigator.locks.request(keyOf(batchId), task) : task();
+// Every overview page shares the extension's origin, so a Web Lock per storage
+// key serializes read-modify-write on that key across pages.
+export function withKeyLock(key, task) {
+  return globalThis.navigator?.locks ? navigator.locks.request(key, task) : task();
 }
+
+const withBatchLock = (batchId, task) => withKeyLock(keyOf(batchId), task);
 
 /* -------------------------------------------------------------- planning */
 
@@ -132,21 +134,22 @@ export async function archivePlan(plan, label = '') {
     .filter((tab) => savedUrls.get(tab.id) === urlOf(tab))
     .map((tab) => tab.id);
 
-  const closeFailed = savedUrls.size - unchanged.length + await closeTabs(unchanged);
+  const closeFailed = savedUrls.size - unchanged.length + (await closeTabs(unchanged)).length;
   return { archived: plan.count, closeFailed, batchId: batch.id };
 }
 
-async function closeTabs(ids) {
-  if (ids.length === 0) return 0;
+// Resolves with the ids that are still open.
+export async function closeTabs(ids) {
+  if (ids.length === 0) return [];
   try {
     await chrome.tabs.remove(ids);
-    return 0;
+    return [];
   } catch {
-    // One stale id fails the whole call, so retry one by one and count what
+    // One stale id fails the whole call, so retry one by one and keep what
     // is genuinely still open.
     await Promise.allSettled(ids.map((id) => chrome.tabs.remove(id)));
     const open = new Set((await chrome.tabs.query({})).map((tab) => tab.id));
-    return ids.filter((id) => open.has(id)).length;
+    return ids.filter((id) => open.has(id));
   }
 }
 
@@ -348,21 +351,7 @@ async function restoreLocked(batchId) {
   const restored = [];
   let failed = 0;
   let windows = 0;
-  let discardedSupported = true;
-
-  // Firefox can create tabs unloaded; Chrome rejects the property. Only when
-  // the plain create then succeeds is the property known to be the problem.
-  const createBackgroundTab = async (windowId, tab) => {
-    const plain = { windowId, url: tab.url, active: false };
-    if (!discardedSupported) return chrome.tabs.create(plain);
-    try {
-      return await chrome.tabs.create({ ...plain, discarded: true, title: tab.title });
-    } catch {
-      const created = await chrome.tabs.create(plain);
-      discardedSupported = false;
-      return created;
-    }
-  };
+  const createBackgroundTab = backgroundTabCreator();
 
   for (const win of batch.windows) {
     let windowId = null;
@@ -392,13 +381,48 @@ async function restoreLocked(batchId) {
   return { restored: restored.length, failed, windows };
 }
 
-async function regroup(win, created, windowId) {
+/**
+ * Returns a function that opens a tab in the background, unloaded where the
+ * browser allows it. windowId null opens it in the current window.
+ */
+export function backgroundTabCreator() {
+  let discardedSupported = true;
+
+  // Firefox can create tabs unloaded; Chrome rejects the property. Only when
+  // the plain create then succeeds is the property known to be the problem.
+  return async (windowId, tab) => {
+    const plain = { ...(windowId === null ? {} : { windowId }), url: tab.url, active: false };
+    if (!discardedSupported) return chrome.tabs.create(plain);
+    try {
+      return await chrome.tabs.create({ ...plain, discarded: true, title: tab.title });
+    } catch {
+      const created = await chrome.tabs.create(plain);
+      discardedSupported = false;
+      return created;
+    }
+  };
+}
+
+/**
+ * Puts the created tabs of each group into a tab group in windowId: the open
+ * group with the same title and color if there is one, otherwise a new one.
+ * created maps a stored tab id to the id of the tab opened for it.
+ */
+export async function regroup(win, created, windowId) {
   if (!chrome.tabs.group) return;
+  const open = chrome.tabGroups?.query
+    ? (await chrome.tabGroups.query({ windowId }).catch(() => [])).filter((group) => group.windowId === windowId)
+    : [];
 
   for (const group of win.groups) {
     const tabIds = group.tabs.map((tab) => created.get(tab.id)).filter((id) => typeof id === 'number');
     if (tabIds.length === 0) continue;
     try {
+      const existing = open.find((candidate) => sameGroup(candidate, group));
+      if (existing) {
+        await chrome.tabs.group({ tabIds, groupId: existing.id });
+        continue;
+      }
       const groupId = await chrome.tabs.group({ tabIds, createProperties: { windowId } });
       await chrome.tabGroups?.update?.(groupId, { title: group.title, color: group.color });
     } catch (error) {
@@ -406,6 +430,10 @@ async function regroup(win, created, windowId) {
     }
   }
 }
+
+// Group ids change when a group is recreated or the browser restarts, so a
+// group is recognized by what the user sees.
+export const sameGroup = (a, b) => (a.title || '') === (b.title || '') && a.color === b.color;
 
 export function deleteBatch(batchId) {
   return withBatchLock(batchId, () => chrome.storage.local.remove(keyOf(batchId)));
