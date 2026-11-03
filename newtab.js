@@ -1320,10 +1320,23 @@ function renderWindow({ win, groups, ungrouped, count }, ctx) {
 
   const meta = el('div', 'window-meta');
   const tabCount = el('span', 'window-count');
-  tabCount.textContent = count === win.tabs.length
-    ? plural(count, 'tab')
-    : `${count} of ${plural(win.tabs.length, 'tab')}`;
-  meta.append(tabCount);
+  const suspended = win.tabs.filter((tab) => tab.suspended).length;
+  const open = win.tabs.length - suspended;
+  if (count !== win.tabs.length) {
+    tabCount.textContent = `${count} of ${plural(win.tabs.length, 'tab')}`;
+    meta.append(tabCount);
+  } else {
+    // Matches the summary, which counts open tabs and suspended ones apart.
+    if (open > 0 || suspended === 0) {
+      tabCount.textContent = plural(open, 'tab');
+      meta.append(tabCount);
+    }
+    if (suspended > 0) {
+      const suspendedCount = el('span', 'window-count');
+      suspendedCount.textContent = `${suspended} suspended`;
+      meta.append(suspendedCount);
+    }
+  }
 
   if (groups.length > 0) {
     const groupCount = el('span', 'window-count');
