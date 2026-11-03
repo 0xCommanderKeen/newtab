@@ -32,12 +32,6 @@
             <button type="button" class="button" id="groups-open" aria-controls="groups-panel" aria-expanded="false">Groups</button>
 
             <button type="button" class="button" id="archive-all" hidden>Archive all</button>
-
-            <div class="archive-tools" id="archive-tools" hidden>
-              <button type="button" class="button" id="archive-export">Export</button>
-              <button type="button" class="button" id="archive-import">Import</button>
-              <input type="file" id="archive-import-file" accept="application/json,.json" hidden>
-            </div>
           </div>
 
           <div class="search">
@@ -61,6 +55,13 @@
       <div class="banner-slot" id="banner" role="status" aria-live="polite" hidden></div>
 
       <section class="groups-panel" id="groups-panel" aria-labelledby="groups-title" hidden></section>
+
+      <div class="archive-tools" id="archive-tools" hidden>
+        <span class="archive-tools-hint">Back up the archive and your custom groups to a file.</span>
+        <button type="button" class="button" id="archive-export">Export</button>
+        <button type="button" class="button" id="archive-import">Import</button>
+        <input type="file" id="archive-import-file" accept="application/json,.json" hidden>
+      </div>
 
       <main class="overview" id="overview"></main>
 
