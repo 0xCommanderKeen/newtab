@@ -498,7 +498,7 @@ function bindEvents() {
 function bindSearch() {
   els.search.addEventListener('input', () => {
     state.query = els.search.value;
-    // A search hides groups without matching tabs, so it would hide the editor of one.
+    // A search hides custom groups without matching tabs, and with them their editor.
     if (state.query.trim()) closeGroupEditor();
     render();
   });
@@ -1104,7 +1104,7 @@ function renderCategory({ meta, tabs, archivable }, ctx) {
   header.append(chevron, dot, name, count);
   header.addEventListener('click', () => toggleCategory(meta.id));
   section.prepend(headerRow('categoryId', meta.id, header,
-    meta.custom && EXTENSION_STORAGE ? editGroupButton(meta) : null,
+    meta.custom ? editGroupButton(meta) : null,
     sectionArchiveButton(ctx, { kind: 'category', id: meta.id, name: meta.label, label: meta.label },
       archivable, 'category-archive', `[data-category-id="${CSS.escape(meta.id)}"] .category-archive`)));
   if (editor) updateGroupEditor(editor, state.customGroups[meta.order], meta.order);
