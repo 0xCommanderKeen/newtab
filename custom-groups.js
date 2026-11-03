@@ -37,27 +37,27 @@ export function normalizeDomain(value) {
   return host + path;
 }
 
-export function normalizeKeyword(value) {
+function normalizeKeyword(value) {
   if (typeof value !== 'string') return null;
   const text = value.trim().toLowerCase().replace(/\s+/g, ' ');
   return text || null;
 }
 
 const unique = (values, normalize) => [...new Set((Array.isArray(values) ? values : []).map(normalize).filter(Boolean))];
-export const normalizeDomains = (values) => unique(values, normalizeDomain);
-export const normalizeKeywords = (values) => unique(values, normalizeKeyword);
+const normalizeDomains = (values) => unique(values, normalizeDomain);
+const normalizeKeywords = (values) => unique(values, normalizeKeyword);
 
 const isObject = (value) => typeof value === 'object' && value !== null && !Array.isArray(value);
 const validId = (value) => typeof value === 'string' && value.length > 0 && value.length <= MAX_ID_LENGTH;
 
-export function normalizeLabel(value) {
+function normalizeLabel(value) {
   const text = typeof value === 'string' ? value.trim().replace(/\s+/g, ' ').slice(0, MAX_LABEL_LENGTH) : '';
   return text || 'Untitled group';
 }
 
 // The one gate for stored groups and imported ones. A group without a usable
 // id, or with an id already seen, is dropped.
-export function normalizeGroups(raw) {
+function normalizeGroups(raw) {
   const seen = new Set();
   const groups = [];
   for (const group of Array.isArray(raw) ? raw : []) {
