@@ -979,6 +979,10 @@ textarea {
   cursor: default;
 }
 
+.window.is-suspended .window-title h2 {
+  white-space: normal;
+}
+
 .window.is-suspended .window-dot {
   background: transparent;
   box-shadow: inset 0 0 0 1.5px var(--text-3);
