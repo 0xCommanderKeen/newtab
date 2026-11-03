@@ -39,6 +39,7 @@ const COLLAPSED_CATEGORIES_KEY = 'tabOverview.collapsedCategories';
 const ARCHIVE_COLLAPSED_KEY = 'tabOverview.collapsedArchiveGroups';
 const VIEW_KEY = 'tabOverview.view';
 const SOURCE_KEY = 'tabOverview.source';
+const SHOW_EMPTY_GROUPS_KEY = 'tabOverview.showEmptyGroups';
 const OPENED_AT_PREFIX = 'tabOpenedAt:';
 const VIEWS = new Set(['windows', 'sorted']);
 const EXTENSION_STORAGE = Boolean(globalThis.chrome?.storage?.local?.get);
@@ -174,6 +175,7 @@ const state = {
     archive: loadSet(ARCHIVE_COLLAPSED_KEY, toStringId),
   },
   collapsedCategories: loadSet(COLLAPSED_CATEGORIES_KEY, toStringId),
+  showEmptyGroups: loadChoice(SHOW_EMPTY_GROUPS_KEY, new Set(['true']), 'false') === 'true',
   // null | { kind: 'confirm', scope, returnFocus } | { kind: 'busy', text }
   //      | { kind: 'result', text, detail, tone, batchId? }
   // scope: { kind: 'all' | 'window' | 'group' | 'category', id, name, label }
@@ -209,6 +211,7 @@ function init() {
   els.banner = document.getElementById('banner');
   els.footerHint = document.getElementById('footer-hint');
   els.groupsAdd = document.getElementById('groups-add');
+  els.groupsShowEmpty = document.getElementById('groups-show-empty');
 
   if (!globalThis.chrome?.tabs?.query || !globalThis.chrome?.windows?.getAll) {
     renderUnsupported();
@@ -707,6 +710,7 @@ function sourceContext(source) {
 }
 
 function renderSource(ctx) {
+  els.groupsShowEmpty.hidden = true;
   const error = ctx.error();
   if (error) {
     renderError(error, ctx.errorTitle);
@@ -719,7 +723,7 @@ function renderSource(ctx) {
   if (totalTabs === 0) {
     mount(createEmptyState(ctx.empty));
     els.summary.textContent = plural(0, ctx.tabNoun);
-    // Custom groups stay listed so they can still be made and edited.
+    // Custom groups can still be shown, made, and edited.
     if (state.view === 'sorted' && !ctx.query) renderSortedView(windows, ctx);
     return;
   }
@@ -982,13 +986,32 @@ function filterWindows(windows, query) {
 
 function renderSortedView(windows, ctx) {
   const categories = buildCategories(windows, ctx.query);
+  const emptyGroups = categories.filter((bucket) => bucket.tabs.length === 0).length;
   for (const bucket of categories) {
-    mount(renderCategory(bucket, ctx));
+    const shown = bucket.tabs.length > 0 || state.showEmptyGroups || openEditor?.id === bucket.meta.groupId;
+    if (shown) mount(renderCategory(bucket, ctx));
   }
+  renderEmptyGroupsToggle(emptyGroups);
   return {
     matched: categories.reduce((sum, bucket) => sum + bucket.tabs.length, 0),
     detail: plural(categories.filter((bucket) => bucket.tabs.length > 0).length, 'category', 'categories'),
   };
+}
+
+function renderEmptyGroupsToggle(count) {
+  const button = els.groupsShowEmpty;
+  button.hidden = count === 0;
+  button.setAttribute('aria-pressed', String(state.showEmptyGroups));
+  button.textContent = state.showEmptyGroups ? 'Hide empty groups' : `Show ${plural(count, 'empty group')}`;
+  button.title = state.showEmptyGroups
+    ? 'Hide your custom groups that have no tabs'
+    : 'Show your custom groups that have no tabs, so you can edit them';
+}
+
+function toggleEmptyGroups() {
+  state.showEmptyGroups = !state.showEmptyGroups;
+  saveValue(SHOW_EMPTY_GROUPS_KEY, String(state.showEmptyGroups));
+  render();
 }
 
 function renderEmptySearch(totalTabs, ctx) {
@@ -1037,8 +1060,8 @@ function restoreFocus(key) {
 const emptyBucket = (meta) => ({ meta, tabs: [], archivable: 0, windows: new Set() });
 
 function buildCategories(windows, query) {
-  // Without a search, every custom group gets a section, so a group with no
-  // tabs yet can be found and edited.
+  // Without a search, every custom group gets a bucket, so the caller can show
+  // the ones with no tabs on request.
   const buckets = new Map(query ? [] : state.groupRules.categories.map((meta) => [meta.id, emptyBucket(meta)]));
 
   for (const win of windows) {
@@ -1725,6 +1748,7 @@ function groupableHost(url) {
 function bindCustomGroups() {
   if (!EXTENSION_STORAGE) return;
   els.groupsAdd.addEventListener('click', addGroup);
+  els.groupsShowEmpty.addEventListener('click', toggleEmptyGroups);
   // mousedown, not click: closing must not rebuild the page under a click
   // that is about to land on another card.
   document.addEventListener('mousedown', (event) => {
@@ -1911,7 +1935,7 @@ function closeGroupEditor({ focusButton = false } = {}) {
   if (item.contains(document.activeElement)) document.activeElement.blur();
   openEditor = null;
   render();
-  if (focusButton) focusFirst([`[data-category-id="${CSS.escape(`custom:${id}`)}"] .category-edit`]);
+  if (focusButton) focusFirst([`[data-category-id="${CSS.escape(`custom:${id}`)}"] .category-edit`, '#groups-show-empty', '#groups-add']);
 }
 
 function createGroupEditor(id) {
