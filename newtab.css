@@ -309,6 +309,10 @@ input {
   --group-color: #22c55e;
 }
 
+.category[data-category="network"] {
+  --group-color: #f97316;
+}
+
 .category[data-category="other"] {
   --group-color: #64748b;
 }
@@ -356,6 +360,10 @@ input {
 
   .category[data-category="health"] {
     --group-color: #86efac;
+  }
+
+  .category[data-category="network"] {
+    --group-color: #fdba74;
   }
 
   .category[data-category="other"] {

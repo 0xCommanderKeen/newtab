@@ -62,7 +62,7 @@ The package is written to `web-ext-artifacts/`.
 - Every window, with the current window first.
 - A **Sorted** view that groups all tabs across windows by category: AI,
   Shopping, Development, Work, News & Reading, Social, Media, Finance,
-  Learning, Travel, Health, and Other.
+  Learning, Travel, Health, Network, and Other.
 - Tab groups shown with their Chrome title and color.
 - Shows how long ago each tab was opened, with the exact time in the tooltip.
 - Pinned, audible, muted, and sleeping (discarded) tabs are marked.
