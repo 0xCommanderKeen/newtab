@@ -498,8 +498,7 @@ function bindEvents() {
 function bindSearch() {
   els.search.addEventListener('input', () => {
     state.query = els.search.value;
-    // A search hides custom groups without matching tabs, and with them their editor.
-    if (state.query.trim()) closeGroupEditor();
+    if (state.query.trim()) openEditor = null;
     render();
   });
 
@@ -615,8 +614,8 @@ function bindArchiveControls() {
   for (const button of els.sourceButtons) {
     button.addEventListener('click', () => switchSource(button.dataset.source));
   }
-  // Arrow keys move between the page tabs, as in any tab list.
   els.sourceSwitch.addEventListener('keydown', (event) => {
+    if (event.altKey || event.metaKey || event.ctrlKey) return;
     const buttons = [...els.sourceButtons];
     const current = buttons.findIndex((button) => button.dataset.source === state.source);
     const index = { ArrowLeft: current - 1, ArrowRight: current + 1, Home: 0, End: buttons.length - 1 }[event.key];
@@ -1894,6 +1893,10 @@ function closeMenu({ focusButton = false } = {}) {
 let openEditor = null;
 
 function openGroupEditor(id, { select = false } = {}) {
+  // A search hides groups without matching tabs, so an edit could hide the
+  // group being edited, and a new group has no tabs at all.
+  state.query = '';
+  els.search.value = '';
   openEditor = createGroupEditor(id);
   render();
   if (!openEditor) return;
@@ -1945,13 +1948,13 @@ function createGroupEditor(id) {
   const actions = el('div', 'group-editor-actions');
   const up = createButton('Move up', () => moveCustomGroup(id, -1), 'is-ghost group-move-up');
   const down = createButton('Move down', () => moveCustomGroup(id, 1), 'is-ghost group-move-down');
-  const remove = createButton('Delete group', () => {
+  const deleteButton = createButton('Delete group', () => {
     openEditor.confirmingDelete = true;
     render();
     item.querySelector('.group-delete-cancel').focus();
   }, 'is-ghost group-delete');
   const done = createButton('Done', () => closeGroupEditor({ focusButton: true }), 'group-edit-done');
-  actions.append(up, down, remove, done);
+  actions.append(up, down, deleteButton, done);
 
   const confirm = el('div', 'group-editor-actions group-delete-prompt');
   const question = el('span', 'group-delete-question');
@@ -1972,13 +1975,16 @@ function createGroupEditor(id) {
     (lines) => save({ keywords: lines }));
   const fields = el('div', 'group-editor-fields');
   fields.append(domains.wrap, keywords.wrap);
+  const hint = el('p', 'group-editor-hint');
+  hint.textContent = 'A domain also covers its subdomains; add a path, like github.com/your-org, to match ' +
+    'only part of a site. Keywords match whole words in the title or address. Fields save when you leave them.';
 
-  item.append(head, fields);
+  item.append(head, fields, hint);
   const section = el('section');
   section.append(item);
   return {
     id, section, item, confirmingDelete: false,
-    label, swatches, up, down, remove, actions, confirm, question,
+    label, swatches, up, down, deleteButton, done, actions, confirm, question,
     domains: domains.area, keywords: keywords.area,
   };
 }
@@ -2002,7 +2008,8 @@ function updateGroupEditor(editor, group, index) {
   }
   editor.up.disabled = busy || index === 0;
   editor.down.disabled = busy || index === state.customGroups.length - 1;
-  editor.remove.disabled = busy;
+  editor.deleteButton.disabled = busy;
+  editor.done.disabled = busy;
   editor.up.setAttribute('aria-label', `Move ${group.label} up`);
   editor.down.setAttribute('aria-label', `Move ${group.label} down`);
 
@@ -2027,11 +2034,6 @@ function listField(title, className, placeholder, save) {
 
 async function addGroup() {
   if (isBusy()) return;
-  // A search hides groups without tabs, and the new group has none yet.
-  if (state.query) {
-    state.query = '';
-    els.search.value = '';
-  }
   const groups = await changeGroups(() => createGroup({ label: 'New group' }));
   const created = groups?.at(-1);
   if (created) openGroupEditor(created.id, { select: true });
@@ -2055,7 +2057,7 @@ function cancelGroupDelete() {
   if (!openEditor) return;
   openEditor.confirmingDelete = false;
   render();
-  openEditor?.remove.focus();
+  openEditor?.deleteButton.focus();
 }
 
 function toggleGroup(ctx, groupId) {
