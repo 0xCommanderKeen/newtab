@@ -18,9 +18,24 @@
             </div>
           </div>
 
-          <div class="view-switch" role="group" aria-label="View">
-            <button type="button" class="view-button is-active" data-view="windows" aria-pressed="true">Windows</button>
-            <button type="button" class="view-button" data-view="sorted" aria-pressed="false">Sorted</button>
+          <div class="controls">
+            <div class="view-switch" id="source-switch" role="group" aria-label="Tabs to show">
+              <button type="button" class="view-button source-button is-active" data-source="open" aria-pressed="true">Open</button>
+              <button type="button" class="view-button source-button" data-source="archive" aria-pressed="false">Archive <span class="source-count" id="archive-count">0</span></button>
+            </div>
+
+            <div class="view-switch" role="group" aria-label="View">
+              <button type="button" class="view-button is-active" data-view="windows" aria-pressed="true">Windows</button>
+              <button type="button" class="view-button" data-view="sorted" aria-pressed="false">Sorted</button>
+            </div>
+
+            <button type="button" class="button" id="archive-all" hidden>Archive all</button>
+
+            <div class="archive-tools" id="archive-tools" hidden>
+              <button type="button" class="button" id="archive-export">Export</button>
+              <button type="button" class="button" id="archive-import">Import</button>
+              <input type="file" id="archive-import-file" accept="application/json,.json" hidden>
+            </div>
           </div>
 
           <div class="search">
@@ -41,11 +56,13 @@
         </div>
       </header>
 
+      <div class="banner-slot" id="banner" role="status" aria-live="polite" hidden></div>
+
       <main class="overview" id="overview"></main>
 
       <footer class="footer">
-        <span>Click a tab to switch to it · Press <kbd>/</kbd> to search</span>
-        <span>Everything stays in your browser. No data leaves this page.</span>
+        <span><span id="footer-hint">Click a tab to switch to it</span> · Press <kbd>/</kbd> to search</span>
+        <span>Everything stays in your browser. Nothing is sent anywhere.</span>
       </footer>
     </div>
 

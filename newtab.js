@@ -1,6 +1,19 @@
 'use strict';
 
 import { CATEGORY_INDEX, categorizeTab } from './categories.js';
+import {
+  GROUP_COLORS,
+  archivePlan,
+  deleteBatch,
+  exportArchive,
+  importArchive,
+  isBatchKey,
+  loadArchive,
+  planArchive,
+  removeArchivedTabs,
+  reopenArchivedTab,
+  restoreBatch,
+} from './archive.js';
 
 const SELF_URL = globalThis.chrome?.runtime?.getURL
   ? chrome.runtime.getURL('newtab.html')
@@ -11,12 +24,14 @@ const EXTENSION_ORIGIN = globalThis.chrome?.runtime?.getURL
 
 const COLLAPSED_KEY = 'tabOverview.collapsedGroups';
 const COLLAPSED_CATEGORIES_KEY = 'tabOverview.collapsedCategories';
+const ARCHIVE_COLLAPSED_KEY = 'tabOverview.collapsedArchiveGroups';
 const VIEW_KEY = 'tabOverview.view';
+const SOURCE_KEY = 'tabOverview.source';
 const OPENED_AT_PREFIX = 'tabOpenedAt:';
 const VIEWS = new Set(['windows', 'sorted']);
-const VALID_COLORS = new Set([
-  'grey', 'blue', 'red', 'yellow', 'green', 'pink', 'purple', 'cyan', 'orange',
-]);
+const ARCHIVE_AVAILABLE = Boolean(globalThis.chrome?.storage?.local?.get);
+const SOURCE_NAMES = new Set(ARCHIVE_AVAILABLE ? ['open', 'archive'] : ['open']);
+const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
 
 const ICONS = {
   chevron:
@@ -65,6 +80,11 @@ const ICONS = {
     'stroke-linejoin="round"/><path d="M12 9v5" stroke="currentColor" ' +
     'stroke-width="1.8" stroke-linecap="round"/><circle cx="12" cy="17" r="1" ' +
     'fill="currentColor"/></svg>',
+  archive:
+    '<svg viewBox="0 0 24 24" fill="none" aria-hidden="true">' +
+    '<rect x="3" y="4" width="18" height="5" rx="1.5" stroke="currentColor" ' +
+    'stroke-width="1.6"/><path d="M5 9v9a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V9M10 13h4" ' +
+    'stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>',
 };
 
 const SOURCES = {
@@ -91,24 +111,58 @@ const SOURCES = {
       middleClick: closeTab,
     },
   },
+  archive: {
+    collapsedKey: ARCHIVE_COLLAPSED_KEY,
+    tabNoun: 'archived tab',
+    containerNoun: ['batch', 'batches'],
+    windows: () => state.batches.flatMap((batch) => batch.windows),
+    containerCount: () => state.batches.length,
+    error: () => state.archiveError,
+    errorTitle: 'Couldn’t read the archive',
+    renderWindows: renderBatchesView,
+    ageOf: archivedAge,
+    empty: {
+      icon: ICONS.archive,
+      title: 'Your archive is empty',
+      message: 'Archive all, on the Open view, saves every open tab here and closes it. ' +
+        'Archived tabs keep their windows and groups, and you can search and reopen them ' +
+        'any time. Import brings back a backup file you exported earlier.',
+      actionLabel: 'Show open tabs',
+      onAction: () => switchSource('open'),
+    },
+    actions: {
+      activate: openArchivedTab,
+      activateLabel: 'Open',
+      dismiss: deleteArchivedTab,
+      dismissLabel: 'Remove from archive',
+    },
+  },
 };
 
 const state = {
   windows: [],
   openedAt: new Map(),
   openError: null,
+  batches: [],
+  archiveError: null,
   query: '',
-  source: 'open',
+  source: loadChoice(SOURCE_KEY, SOURCE_NAMES, 'open'),
   view: loadChoice(VIEW_KEY, VIEWS, 'windows'),
   collapsed: {
     open: loadSet(COLLAPSED_KEY, toNumberId),
+    archive: loadSet(ARCHIVE_COLLAPSED_KEY, toStringId),
   },
   collapsedCategories: loadSet(COLLAPSED_CATEGORIES_KEY, toStringId),
+  // null | { kind: 'confirm', count, skipped } | { kind: 'busy', text }
+  //      | { kind: 'result', text, detail, tone }
+  prompt: null,
+  confirmDeleteBatchId: null,
   loading: true,
 };
 
 const els = {};
 const iconTemplates = new Map();
+const pendingArchivedTabs = new Set();
 let refreshTimer = null;
 
 /* ------------------------------------------------------------------ startup */
@@ -118,6 +172,16 @@ function init() {
   els.summary = document.getElementById('summary');
   els.search = document.getElementById('search');
   els.viewButtons = document.querySelectorAll('.view-button[data-view]');
+  els.sourceSwitch = document.getElementById('source-switch');
+  els.sourceButtons = document.querySelectorAll('.source-button');
+  els.archiveCount = document.getElementById('archive-count');
+  els.archiveAll = document.getElementById('archive-all');
+  els.archiveTools = document.getElementById('archive-tools');
+  els.archiveExport = document.getElementById('archive-export');
+  els.archiveImport = document.getElementById('archive-import');
+  els.archiveImportFile = document.getElementById('archive-import-file');
+  els.banner = document.getElementById('banner');
+  els.footerHint = document.getElementById('footer-hint');
 
   if (!globalThis.chrome?.tabs?.query || !globalThis.chrome?.windows?.getAll) {
     renderUnsupported();
@@ -127,6 +191,7 @@ function init() {
   bindEvents();
   bindSearch();
   bindViewSwitch();
+  bindArchiveControls();
   applyViewButtons();
 
   requestTimeSync()
@@ -148,10 +213,17 @@ async function requestTimeSync() {
   }
 }
 
-const LOADERS = { open: loadOpen };
+const LOADERS = ARCHIVE_AVAILABLE
+  ? { open: loadOpen, archive: loadArchiveState }
+  : { open: loadOpen };
 const pendingParts = new Set();
 
+const isBusy = () => state.prompt?.kind === 'busy';
+
 async function refresh(parts = Object.keys(LOADERS)) {
+  // Long archive operations refresh once when they finish; re-rendering on
+  // every intermediate tab or storage event would only flicker.
+  if (isBusy()) return;
   await Promise.all(parts.map((part) => LOADERS[part]()));
   state.loading = false;
   render();
@@ -177,6 +249,25 @@ async function loadOpen() {
   } catch (error) {
     console.error('Tab Overview: failed to read tabs', error);
     state.openError = error;
+  }
+}
+
+async function loadArchiveState() {
+  try {
+    const batches = await loadArchive();
+    for (const batch of batches) {
+      const badge = {
+        text: formatShortDate(batch.archivedAt),
+        title: `Archived ${formatDate(batch.archivedAt)}`,
+      };
+      for (const win of batch.windows) win.badge = badge;
+    }
+    state.batches = batches;
+    state.archiveError = null;
+    pruneCollapsed('archive', batches.flatMap((batch) => batch.windows));
+  } catch (error) {
+    console.error('Tab Overview: failed to read the archive', error);
+    state.archiveError = error;
   }
 }
 
@@ -301,9 +392,12 @@ function bindEvents() {
   }
 
   chrome.storage?.onChanged?.addListener((changes, areaName) => {
-    if (areaName !== 'session') return;
-    if (Object.keys(changes).some((key) => key.startsWith(OPENED_AT_PREFIX))) {
+    const keys = Object.keys(changes);
+    if (areaName === 'session' && keys.some((key) => key.startsWith(OPENED_AT_PREFIX))) {
       reload();
+    }
+    if (areaName === 'local' && ARCHIVE_AVAILABLE && keys.some(isBatchKey)) {
+      scheduleRefresh('archive');
     }
   });
 }
@@ -331,6 +425,14 @@ function bindSearch() {
   });
 
   document.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape' && (state.prompt?.kind === 'confirm' || state.confirmDeleteBatchId)) {
+      event.preventDefault();
+      if (state.prompt?.kind === 'confirm') state.prompt = null;
+      state.confirmDeleteBatchId = null;
+      render();
+      return;
+    }
+
     if (event.key === 'Escape' && state.query) {
       event.preventDefault();
       clearSearch();
@@ -375,7 +477,43 @@ function applyViewButtons() {
     const active = button.dataset.view === state.view;
     button.classList.toggle('is-active', active);
     button.setAttribute('aria-pressed', String(active));
+    if (button.dataset.view === 'windows') {
+      button.textContent = state.source === 'archive' ? 'Batches' : 'Windows';
+    }
   }
+  for (const button of els.sourceButtons) {
+    const active = button.dataset.source === state.source;
+    button.classList.toggle('is-active', active);
+    button.setAttribute('aria-pressed', String(active));
+  }
+}
+
+function bindArchiveControls() {
+  els.sourceSwitch.hidden = !ARCHIVE_AVAILABLE;
+  els.archiveAll.hidden = !ARCHIVE_AVAILABLE;
+  els.archiveTools.hidden = !ARCHIVE_AVAILABLE;
+  if (!ARCHIVE_AVAILABLE) return;
+
+  for (const button of els.sourceButtons) {
+    button.addEventListener('click', () => switchSource(button.dataset.source));
+  }
+  els.archiveAll.addEventListener('click', promptArchiveAll);
+  els.archiveExport.addEventListener('click', downloadArchive);
+  els.archiveImport.addEventListener('click', () => els.archiveImportFile.click());
+  els.archiveImportFile.addEventListener('change', () => {
+    const [file] = els.archiveImportFile.files;
+    els.archiveImportFile.value = '';
+    if (file) importArchiveFile(file);
+  });
+}
+
+function switchSource(source) {
+  if (!SOURCE_NAMES.has(source) || source === state.source) return;
+  state.source = source;
+  state.confirmDeleteBatchId = null;
+  saveValue(SOURCE_KEY, source);
+  applyViewButtons();
+  render();
 }
 
 /* ------------------------------------------------------------------ render */
@@ -385,6 +523,8 @@ function render() {
 
   const focus = focusKey();
   const ctx = sourceContext(state.source);
+  renderControls();
+  renderBanner();
 
   if (state.loading) {
     els.summary.textContent = 'Reading your tabs…';
@@ -435,6 +575,171 @@ function renderSource(ctx) {
   els.summary.textContent = ctx.query
     ? matchSummary(matched, totalTabs, ctx.tabNoun)
     : `${plural(totalTabs, ctx.tabNoun)} · ${detail} · ${plural(ctx.containerCount(), one, many)}`;
+}
+
+function renderControls() {
+  if (!ARCHIVE_AVAILABLE) return;
+  const busy = isBusy();
+  const archived = state.batches.reduce((sum, batch) => sum + batch.tabCount, 0);
+  els.archiveCount.textContent = String(archived);
+
+  const count = planArchive(state.windows).count;
+  els.archiveAll.hidden = state.source !== 'open';
+  els.archiveAll.disabled = busy || count === 0;
+  els.archiveAll.title = count === 0
+    ? 'No tabs to archive'
+    : `Save ${plural(count, 'tab')} to the archive and close them`;
+
+  els.archiveTools.hidden = state.source !== 'archive';
+  els.archiveExport.disabled = busy || archived === 0;
+  els.archiveImport.disabled = busy;
+
+  els.footerHint.textContent = state.source === 'archive'
+    ? 'Click an archived tab to reopen it'
+    : 'Click a tab to switch to it';
+}
+
+const BANNERS = {
+  confirm: (prompt) => ({
+    text: `Archive and close ${plural(prompt.count, 'tab')}?`,
+    detail: leftOpenText(prompt.skipped, 'stay open'),
+    buttons: [
+      { id: 'archive-confirm', label: 'Archive and close', primary: true, onClick: confirmArchiveAll },
+      { id: 'archive-cancel', label: 'Cancel', onClick: dismissPrompt },
+    ],
+  }),
+  busy: (prompt) => ({ text: prompt.text, buttons: [] }),
+  result: (prompt) => ({
+    text: prompt.text,
+    detail: prompt.detail,
+    tone: prompt.tone,
+    buttons: [{ id: 'banner-dismiss', label: 'Dismiss', onClick: dismissPrompt }],
+  }),
+};
+
+function renderBanner() {
+  const prompt = state.prompt;
+  els.banner.hidden = !prompt;
+  if (!prompt) {
+    els.banner.replaceChildren();
+    return;
+  }
+
+  const view = BANNERS[prompt.kind](prompt);
+  const banner = el('div', 'banner');
+  banner.dataset.kind = prompt.kind;
+  if (view.tone) banner.dataset.tone = view.tone;
+
+  const text = el('div', 'banner-text');
+  const strong = el('strong');
+  strong.textContent = view.text;
+  text.append(strong);
+  if (view.detail) {
+    const detail = el('span', 'banner-detail');
+    detail.textContent = view.detail;
+    text.append(detail);
+  }
+
+  const buttons = el('div', 'banner-actions');
+  for (const spec of view.buttons) {
+    const button = createButton(spec.label, spec.onClick, spec.primary ? 'is-primary' : '');
+    button.id = spec.id;
+    buttons.append(button);
+  }
+
+  banner.append(text, buttons);
+  els.banner.replaceChildren(banner);
+}
+
+function dismissPrompt() {
+  if (isBusy()) return;
+  state.prompt = null;
+  render();
+}
+
+function createButton(label, onClick, modifier = '') {
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.className = `button ${modifier}`.trim();
+  button.textContent = label;
+  button.disabled = isBusy();
+  button.addEventListener('click', onClick);
+  return button;
+}
+
+const SKIP_LABELS = {
+  pinned: ['pinned', 'pinned'],
+  private: ['private', 'private'],
+  unsupported: ['browser or local page', 'browser or local pages'],
+};
+
+function leftOpenText(skipped, verb) {
+  const parts = Object.entries(skipped)
+    .filter(([, count]) => count > 0)
+    .map(([reason, count]) => `${count} ${SKIP_LABELS[reason][count === 1 ? 0 : 1]}`);
+  if (parts.length === 0) return '';
+  const total = Object.values(skipped).reduce((sum, count) => sum + count, 0);
+  return `${plural(total, 'tab')} ${verb}: ${parts.join(', ')}.`;
+}
+
+function renderBatchesView(ctx) {
+  let matched = 0;
+  let groups = 0;
+
+  for (const batch of state.batches) {
+    const { sections, matched: count } = filterWindows(batch.windows, ctx.query);
+    if (count === 0) continue;
+    matched += count;
+    groups += countGroups(batch.windows);
+    els.overview.append(renderBatch(batch, sections, count, ctx));
+  }
+
+  return { matched, detail: plural(groups, 'group') };
+}
+
+function renderBatch(batch, sections, count, ctx) {
+  const section = el('section', 'batch');
+  section.dataset.batchId = batch.id;
+
+  const head = el('div', 'batch-head');
+  const heading = document.createElement('h2');
+  const tabs = count === batch.tabCount
+    ? plural(count, 'tab')
+    : `${count} of ${plural(batch.tabCount, 'tab')}`;
+  heading.textContent = `${formatDate(batch.archivedAt)} · ${tabs}`;
+  heading.title = `Archived ${new Date(batch.archivedAt).toLocaleString()}`;
+
+  const actions = el('div', 'batch-actions');
+  if (state.confirmDeleteBatchId === batch.id) {
+    const question = el('span', 'batch-question');
+    question.textContent = `Delete ${plural(batch.tabCount, 'archived tab')}?`;
+    actions.append(
+      question,
+      createButton('Delete', () => deleteArchivedBatch(batch), 'is-danger batch-delete-confirm'),
+      createButton('Cancel', () => {
+        state.confirmDeleteBatchId = null;
+        render();
+      }, 'batch-delete-cancel'),
+    );
+  } else {
+    const restore = createButton('Restore', () => restoreArchivedBatch(batch), 'batch-restore');
+    restore.title = `Reopen ${plural(batch.tabCount, 'tab')} in ${plural(batch.windows.length, 'window')}`;
+    actions.append(
+      restore,
+      createButton('Delete', () => {
+        state.confirmDeleteBatchId = batch.id;
+        render();
+        els.overview
+          .querySelector(`[data-batch-id="${CSS.escape(batch.id)}"] .batch-delete-cancel`)
+          ?.focus();
+      }, 'batch-delete'),
+    );
+  }
+
+  head.append(heading, actions);
+  section.append(head);
+  for (const windowSection of sections) section.append(renderWindow(windowSection, ctx));
+  return section;
 }
 
 function renderWindowView(ctx) {
@@ -496,7 +801,8 @@ function focusKey() {
     if (!scope) continue;
     const base = `[${attr}="${CSS.escape(scope.getAttribute(attr))}"]`;
     if (scope === active) return base;
-    return active.classList[0] ? `${base} .${CSS.escape(active.classList[0])}` : null;
+    const classes = [...active.classList].map((name) => `.${CSS.escape(name)}`).join('');
+    return classes ? `${base} ${classes}` : null;
   }
   return null;
 }
@@ -651,7 +957,7 @@ function renderWindow({ win, groups, ungrouped, count }, ctx) {
 
 function renderGroup(group, ctx) {
   const section = el('section', 'group');
-  const color = VALID_COLORS.has(group.color) ? group.color : 'grey';
+  const color = GROUP_COLORS.has(group.color) ? group.color : 'grey';
   section.dataset.color = color;
 
   const isCollapsed = ctx.query === '' && ctx.collapsed.has(group.id);
@@ -714,7 +1020,7 @@ function renderTab(tab, ctx, options = {}) {
   const { actions } = ctx;
   const card = el('div', 'tab');
   card.dataset.tabId = String(tab.id);
-  if (tab.bookmarkId) card.dataset.bookmarkId = tab.bookmarkId;
+  if (ctx.source === 'archive') card.dataset.archiveId = tab.id;
 
   const titleText = tab.title?.trim() || displayUrl(tab.url) || 'Untitled tab';
   card.title = [tab.title?.trim(), tab.url].filter(Boolean).join('\n');
@@ -805,6 +1111,14 @@ function renderTab(tab, ctx, options = {}) {
   }
 
   return card;
+}
+
+function archivedAge(tab) {
+  return {
+    since: tab.archivedAt,
+    prefix: 'archived ',
+    title: `Archived ${new Date(tab.archivedAt).toLocaleString()}`,
+  };
 }
 
 function openedAge(tab) {
@@ -943,6 +1257,153 @@ async function closeTab(tab) {
   }
 }
 
+function promptArchiveAll() {
+  if (isBusy()) return;
+  const plan = planArchive(state.windows);
+  if (plan.count === 0) return;
+  state.prompt = { kind: 'confirm', count: plan.count, skipped: plan.skipped };
+  render();
+  document.getElementById('archive-confirm')?.focus();
+}
+
+async function confirmArchiveAll() {
+  if (isBusy()) return;
+  state.prompt = { kind: 'busy', text: 'Archiving tabs…' };
+  render();
+
+  let result;
+  try {
+    // Re-read so tabs opened or closed since the confirmation are accounted for.
+    const plan = planArchive(await readOpenWindows());
+    const { archived, closeFailed } = await archivePlan(plan);
+    const notes = [leftOpenText(plan.skipped, 'left open')];
+    if (closeFailed > 0) {
+      notes.push(`${plural(closeFailed, 'archived tab')} could not be closed.`);
+    }
+    result = {
+      kind: 'result',
+      text: `Archived ${plural(archived, 'tab')}`,
+      detail: notes.filter(Boolean).join(' '),
+      tone: closeFailed > 0 ? 'warn' : '',
+    };
+    if (archived > 0) {
+      state.source = 'archive';
+      saveValue(SOURCE_KEY, 'archive');
+      applyViewButtons();
+    }
+  } catch (error) {
+    console.error('Tab Overview: archive failed', error);
+    result = {
+      kind: 'result',
+      text: 'Nothing was archived and no tab was closed',
+      detail: error?.message || '',
+      tone: 'error',
+    };
+  }
+
+  state.prompt = result;
+  await refresh();
+}
+
+async function restoreArchivedBatch(batch) {
+  if (isBusy()) return;
+  state.prompt = { kind: 'busy', text: `Restoring ${plural(batch.tabCount, 'tab')}…` };
+  render();
+
+  let result;
+  try {
+    const { restored, failed, windows } = await restoreBatch(batch.id);
+    result = {
+      kind: 'result',
+      text: `Restored ${plural(restored, 'tab')} in ${plural(windows, 'window')}`,
+      detail: failed > 0 ? `${plural(failed, 'tab')} could not be opened and stay in the archive.` : '',
+      tone: failed > 0 ? 'warn' : '',
+    };
+  } catch (error) {
+    console.error('Tab Overview: restore failed', error);
+    result = { kind: 'result', text: 'Could not restore the batch', detail: error?.message || '', tone: 'error' };
+  }
+
+  state.prompt = result;
+  await refresh();
+}
+
+async function deleteArchivedBatch(batch) {
+  if (isBusy()) return;
+  state.confirmDeleteBatchId = null;
+  try {
+    await deleteBatch(batch.id);
+  } catch (error) {
+    console.error('Tab Overview: could not delete batch', error);
+    state.prompt = { kind: 'result', text: 'Could not delete the batch', detail: error?.message || '', tone: 'error' };
+  }
+  await refresh(['archive']);
+}
+
+async function openArchivedTab(tab) {
+  await changeArchivedTab(tab, reopenArchivedTab, 'could not reopen archived tab');
+}
+
+async function deleteArchivedTab(tab) {
+  await changeArchivedTab(tab, (target) => removeArchivedTabs(target.batchId, [target.id]),
+    'could not remove archived tab');
+}
+
+// A second click while the first is still writing would open the page twice.
+async function changeArchivedTab(tab, change, failure) {
+  if (isBusy() || pendingArchivedTabs.has(tab.id)) return;
+  pendingArchivedTabs.add(tab.id);
+  try {
+    await change(tab);
+  } catch (error) {
+    console.warn(`Tab Overview: ${failure}`, error);
+  } finally {
+    pendingArchivedTabs.delete(tab.id);
+    scheduleRefresh('archive');
+  }
+}
+
+async function downloadArchive() {
+  if (isBusy()) return;
+  try {
+    const backup = await exportArchive();
+    const blob = new Blob([JSON.stringify(backup, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `tab-archive-${isoDate(new Date())}.json`;
+    document.body.append(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 10_000);
+  } catch (error) {
+    console.error('Tab Overview: export failed', error);
+    state.prompt = { kind: 'result', text: 'Could not export the archive', detail: error?.message || '', tone: 'error' };
+    render();
+  }
+}
+
+async function importArchiveFile(file) {
+  if (isBusy()) return;
+  let result;
+  try {
+    const { batches, tabs, skipped, invalid } = await importArchive(await file.text());
+    const notes = [];
+    if (skipped > 0) notes.push(`${plural(skipped, 'batch', 'batches')} already in the archive were skipped.`);
+    if (invalid > 0) notes.push(`${plural(invalid, 'batch', 'batches')} had no tabs that can be reopened.`);
+    result = {
+      kind: 'result',
+      text: `Imported ${plural(batches, 'batch', 'batches')}, ${plural(tabs, 'tab')}`,
+      detail: notes.join(' '),
+      tone: '',
+    };
+  } catch (error) {
+    result = { kind: 'result', text: 'Nothing was imported', detail: error?.message || '', tone: 'error' };
+  }
+  state.prompt = result;
+  await refresh(['archive']);
+}
+
 function toggleGroup(ctx, groupId) {
   if (ctx.collapsed.has(groupId)) {
     ctx.collapsed.delete(groupId);
@@ -1015,6 +1476,23 @@ function countVisible({ groups, ungrouped }) {
 
 function plural(count, word, pluralWord = `${word}s`) {
   return `${count} ${count === 1 ? word : pluralWord}`;
+}
+
+function formatDate(timestamp) {
+  const date = new Date(timestamp);
+  const pad = (value) => String(value).padStart(2, '0');
+  return `${formatShortDate(timestamp)} ${date.getFullYear()}, ` +
+    `${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+function formatShortDate(timestamp) {
+  const date = new Date(timestamp);
+  return `${date.getDate()} ${MONTHS[date.getMonth()]}`;
+}
+
+function isoDate(date) {
+  const pad = (value) => String(value).padStart(2, '0');
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
 }
 
 function formatAge(openedAt) {

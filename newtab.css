@@ -14,6 +14,10 @@
   --accent-soft: rgba(37, 99, 235, 0.1);
   --accent-border: rgba(37, 99, 235, 0.28);
   --danger: #dc2626;
+  --danger-soft: rgba(220, 38, 38, 0.08);
+  --warn: #b45309;
+  --warn-soft: rgba(217, 119, 6, 0.1);
+  --on-accent: #ffffff;
   --shadow: 0 1px 2px rgba(16, 24, 40, 0.04), 0 8px 24px rgba(16, 24, 40, 0.05);
   --radius: 18px;
   --font: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
@@ -35,6 +39,10 @@
     --accent-soft: rgba(122, 162, 255, 0.12);
     --accent-border: rgba(122, 162, 255, 0.32);
     --danger: #ff7b7b;
+    --danger-soft: rgba(255, 123, 123, 0.1);
+    --warn: #fbbf24;
+    --warn-soft: rgba(251, 191, 36, 0.1);
+    --on-accent: #0f1115;
     --shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 12px 32px rgba(0, 0, 0, 0.25);
   }
 }
@@ -126,6 +134,89 @@ input {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+/* ---------------------------------------------------------------- controls */
+
+.controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+}
+
+.controls [hidden] {
+  display: none;
+}
+
+.archive-tools {
+  display: inline-flex;
+  gap: 6px;
+}
+
+.source-count {
+  display: inline-block;
+  min-width: 18px;
+  margin-left: 4px;
+  padding: 0 5px;
+  border-radius: 999px;
+  background: var(--border);
+  color: var(--text-2);
+  font-size: 10.5px;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.6;
+  text-align: center;
+}
+
+.button {
+  padding: 7px 12px;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: var(--bg-elev);
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: background-color 0.12s ease, border-color 0.12s ease, color 0.12s ease;
+}
+
+.button:hover:not(:disabled) {
+  border-color: var(--border-strong);
+  background: var(--bg-soft);
+}
+
+.button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.button.is-primary {
+  border-color: var(--accent);
+  background: var(--accent);
+  color: var(--on-accent);
+}
+
+.button.is-primary:hover:not(:disabled) {
+  border-color: var(--accent);
+  background: var(--accent);
+  filter: brightness(1.08);
+}
+
+.button.is-danger {
+  border-color: var(--danger);
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+
+.button.is-danger:hover:not(:disabled) {
+  border-color: var(--danger);
+  background: var(--danger-soft);
 }
 
 /* ------------------------------------------------------------- view switch */
@@ -225,6 +316,63 @@ input {
 
 .search input:focus ~ kbd {
   opacity: 0;
+}
+
+/* ------------------------------------------------------------------ banner */
+
+.banner-slot {
+  max-width: 1240px;
+  margin: 0 auto;
+  padding: 20px 28px 0;
+}
+
+.banner-slot[hidden] {
+  display: none;
+}
+
+.banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 12px 14px 12px 18px;
+  border: 1px solid var(--accent-border);
+  border-radius: 14px;
+  background: var(--accent-soft);
+}
+
+.banner[data-tone="warn"] {
+  border-color: var(--warn);
+  background: var(--warn-soft);
+}
+
+.banner[data-tone="error"] {
+  border-color: var(--danger);
+  background: var(--danger-soft);
+}
+
+.banner-text {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 10px;
+  min-width: 0;
+  font-size: 13px;
+}
+
+.banner-text strong {
+  font-weight: 650;
+}
+
+.banner-detail {
+  color: var(--text-2);
+  font-size: 12.5px;
+}
+
+.banner-actions {
+  display: flex;
+  flex: none;
+  gap: 8px;
 }
 
 /* ---------------------------------------------------------------- overview */
@@ -428,6 +576,46 @@ input {
   display: flex;
   flex-direction: column;
   gap: 10px;
+}
+
+/* ----------------------------------------------------------------- batches */
+
+.batch {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.batch + .batch {
+  margin-top: 14px;
+}
+
+.batch-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px 16px;
+  padding: 0 4px;
+}
+
+.batch-head h2 {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+  font-variant-numeric: tabular-nums;
+}
+
+.batch-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.batch-question {
+  color: var(--text-2);
+  font-size: 12.5px;
 }
 
 /* ------------------------------------------------------------------ groups */
@@ -907,8 +1095,17 @@ input {
     flex-basis: auto;
   }
 
-  .view-switch {
+  .controls {
     align-self: flex-start;
+  }
+
+  .banner-slot {
+    padding: 14px 14px 0;
+  }
+
+  .banner {
+    flex-direction: column;
+    align-items: stretch;
   }
 
   .overview {
