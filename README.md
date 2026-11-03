@@ -226,9 +226,13 @@ is visible.
 - Archived and suspended tabs keep their title, address, and (in Firefox)
   favicon. Page state such as scroll position, form input, and back/forward
   history is not kept.
-- After a browser restart a new window can get the id of an old one. Suspended
-  tabs saved with that id then show in the new window, not under **Suspended
-  from closed windows**. They still reopen there, in their tab group.
+- A suspended tab's place among its neighbors is approximate. It comes from
+  the tab's index when it was suspended, so tabs moved or reopened since then
+  can shift it. Its window and tab group are not affected. **Reopen N** adds
+  tabs at the end of the window.
+- Window ids don't last across a restart, so after one, or after an import,
+  suspended tabs go by their tab group, and otherwise to **Suspended from closed
+  windows**.
 - In the archive, a window's grouped tabs are listed before its ungrouped tabs,
   and a restored window opens them in that order.
 
@@ -236,7 +240,7 @@ is visible.
 
 ```
 manifest.json     Manifest V3 definition for Chrome and Firefox, new tab override, and background worker
-background.js     Records tab open times and cleans them up
+background.js     Records tab open times and cleans them up, and clears saved window ids on a new browser session
 categories.js     Domain and keyword rules for the sorted view, and custom group matching
 custom-groups.js  Custom group storage, validation, and edits
 newtab.html       Page shell

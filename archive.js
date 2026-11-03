@@ -543,7 +543,8 @@ export async function importArchive(text) {
     const entry = normalizeSuspended(raw, id, fallbackArchivedAt);
     if (!entry) continue;
     taken.add(suspendedKey(id));
-    additions[suspendedKey(id)] = entry;
+    // A window id from another browser session names no window here.
+    additions[suspendedKey(id)] = { ...entry, windowId: null };
     result.suspended += 1;
   }
 
