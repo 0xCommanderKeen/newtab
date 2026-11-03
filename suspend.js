@@ -56,16 +56,18 @@ export function placeSuspended(windows, groups, entries) {
   };
 
   const byWindow = new Map();
-  const ordered = [...entries].sort((a, b) => (a.windowId ?? -1) - (b.windowId ?? -1) || a.index - b.index);
-  for (const entry of ordered) {
+  const closedWindows = new Map();
+  for (const entry of [...entries].sort(newestFirst)) {
     const windowId = windowFor(entry);
-    if (!byWindow.has(windowId)) byWindow.set(windowId, []);
-    byWindow.get(windowId).push({ ...entry, suspended: true, windowId, groupId: groupIn(windowId, entry.group) });
+    const tab = { ...entry, suspended: true, windowId, groupId: groupIn(windowId, entry.group) };
+    const lists = windowId === SUSPENDED_WINDOW_ID ? closedWindows : byWindow;
+    const list = windowId === SUSPENDED_WINDOW_ID ? entry.windowId : windowId;
+    if (!lists.has(list)) lists.set(list, []);
+    lists.get(list).push(tab);
   }
 
   const placed = windows.map((win) => {
-    const tabs = [...win.tabs];
-    for (const tab of byWindow.get(win.id) || []) tabs.splice(Math.min(tab.index, tabs.length), 0, tab);
+    const tabs = insertAtSavedIndex(win.tabs, byWindow.get(win.id) || []);
     let open = 0;
     for (const tab of tabs) {
       if (tab.suspended) tab.reopenIndex = open;
@@ -77,8 +79,30 @@ export function placeSuspended(windows, groups, entries) {
   return {
     windows: placed,
     groups: [...groups, ...rebuilt.values()],
-    orphans: byWindow.get(SUSPENDED_WINDOW_ID) || [],
+    orphans: [...closedWindows.entries()]
+      .sort(([a], [b]) => (a ?? -1) - (b ?? -1))
+      .flatMap(([, tabs]) => insertAtSavedIndex([], tabs)),
   };
+}
+
+// An index was saved against the tabs open at that moment, and the tabs
+// suspended later were still among them. Putting the newest back first rebuilds
+// the list that each older index refers to.
+function newestFirst(a, b) {
+  return b.suspendedAt - a.suspendedAt || a.index - b.index;
+}
+
+// Positions are not clamped to the list: the tabs an index counted may be gone,
+// and the tabs after it must still move aside.
+function insertAtSavedIndex(tabs, suspended) {
+  const placed = tabs.map((tab, position) => ({ tab, position }));
+  for (const tab of suspended) {
+    for (const item of placed) {
+      if (item.position >= tab.index) item.position += 1;
+    }
+    placed.push({ tab, position: tab.index });
+  }
+  return placed.sort((a, b) => a.position - b.position).map((item) => item.tab);
 }
 
 /**
