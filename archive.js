@@ -100,7 +100,9 @@ export function planArchive(windows) {
 /**
  * Writes the whole batch, reads it back, and only then closes the tabs. If
  * the write fails no tab is closed. A tab that navigated since it was read is
- * left open, because the archive holds its old address.
+ * left open, because the archive holds its old address. A suspended tab in
+ * the plan has no browser tab; once the batch is saved it stops being
+ * suspended.
  */
 export async function archivePlan(plan, label = '') {
   if (plan.count === 0) return { archived: 0, closeFailed: 0, batchId: null };
@@ -136,10 +138,10 @@ export async function archivePlan(plan, label = '') {
     throw new Error('The archive could not be saved completely, so no tab was closed.');
   }
 
-  const savedUrls = new Map(plan.windows.flatMap((win) => [
-    ...win.groups.flatMap(({ tabs }) => tabs),
-    ...win.ungrouped,
-  ]).map((tab) => [tab.id, urlOf(tab)]));
+  const planned = plan.windows.flatMap((win) => [...win.groups.flatMap(({ tabs }) => tabs), ...win.ungrouped]);
+  await forgetSuspended(planned.filter((tab) => tab.suspended).map((tab) => tab.id));
+
+  const savedUrls = new Map(planned.filter((tab) => !tab.suspended).map((tab) => [tab.id, urlOf(tab)]));
   const unchanged = (await chrome.tabs.query({}))
     .filter((tab) => savedUrls.get(tab.id) === urlOf(tab))
     .map((tab) => tab.id);
