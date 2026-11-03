@@ -337,10 +337,24 @@ function bindPointerHold() {
   document.addEventListener('pointercancel', release, true);
 }
 
+// Reading suspended tabs reads all of storage, archive included, so it happens
+// once per change and not on every tab event. The version tells a read that
+// began before a change from one that saw it.
+let suspendedVersion = 0;
+let suspendedCache = { version: -1, entries: [] };
+
+async function currentSuspended() {
+  if (!EXTENSION_STORAGE) return [];
+  if (suspendedCache.version === suspendedVersion) return suspendedCache.entries;
+  const version = suspendedVersion;
+  const entries = await loadSuspended();
+  suspendedCache = { version, entries };
+  return entries;
+}
+
 async function loadOpen() {
   try {
-    const suspended = EXTENSION_STORAGE ? await loadSuspended() : [];
-    const [windows, openedAt] = await Promise.all([readOpenWindows(suspended), loadTabTimes()]);
+    const [windows, openedAt] = await Promise.all([readOpenWindows(await currentSuspended()), loadTabTimes()]);
     state.windows = windows;
     state.openedAt = openedAt;
     state.openError = null;
@@ -529,6 +543,7 @@ function bindEvents() {
       scheduleRefresh('archive');
     }
     if (areaName === 'local' && EXTENSION_STORAGE && keys.some(isSuspendedKey)) {
+      suspendedVersion += 1;
       reload();
     }
     if (areaName === 'local' && EXTENSION_STORAGE && keys.includes(GROUPS_KEY)) {
