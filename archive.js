@@ -26,7 +26,14 @@ export const GROUP_COLORS = new Set([
 
 export const isBatchKey = (key) => key.startsWith(BATCH_PREFIX);
 const keyOf = (batchId) => BATCH_PREFIX + batchId;
-const urlOf = (tab) => tab.url || tab.pendingUrl || '';
+// While Chrome navigates, url is still the old page and pendingUrl the new one.
+const urlOf = (tab) => (isReopenable(tab.pendingUrl) ? tab.pendingUrl : tab.url || tab.pendingUrl || '');
+
+// Every overview page shares the extension's origin, so a Web Lock per batch
+// serializes read-modify-write on that batch across pages.
+function withBatchLock(batchId, task) {
+  return globalThis.navigator?.locks ? navigator.locks.request(keyOf(batchId), task) : task();
+}
 
 /* -------------------------------------------------------------- planning */
 
@@ -41,10 +48,6 @@ function isReopenable(url) {
   return typeof url === 'string' && /^https?:\/\//i.test(url);
 }
 
-/**
- * Splits open windows (the overview's window model) into what gets archived
- * and what stays open.
- */
 export function planArchive(windows) {
   const skipped = { pinned: 0, private: 0, unsupported: 0 };
   const planned = [];
@@ -83,7 +86,8 @@ export function planArchive(windows) {
 
 /**
  * Writes the whole batch, reads it back, and only then closes the tabs. If
- * the write fails no tab is closed.
+ * the write fails no tab is closed. A tab that navigated since it was read is
+ * left open, because the archive holds its old address.
  */
 export async function archivePlan(plan) {
   if (plan.count === 0) return { archived: 0, closeFailed: 0 };
@@ -118,14 +122,20 @@ export async function archivePlan(plan) {
     throw new Error('The archive could not be saved completely, so no tab was closed.');
   }
 
-  const ids = plan.windows.flatMap((win) => [
-    ...win.groups.flatMap(({ tabs }) => tabs.map((tab) => tab.id)),
-    ...win.ungrouped.map((tab) => tab.id),
-  ]);
-  return { archived: ids.length, closeFailed: await closeTabs(ids) };
+  const savedUrls = new Map(plan.windows.flatMap((win) => [
+    ...win.groups.flatMap(({ tabs }) => tabs),
+    ...win.ungrouped,
+  ]).map((tab) => [tab.id, urlOf(tab)]));
+  const unchanged = (await chrome.tabs.query({}))
+    .filter((tab) => savedUrls.get(tab.id) === urlOf(tab))
+    .map((tab) => tab.id);
+
+  const closeFailed = savedUrls.size - unchanged.length + await closeTabs(unchanged);
+  return { archived: plan.count, closeFailed };
 }
 
 async function closeTabs(ids) {
+  if (ids.length === 0) return 0;
   try {
     await chrome.tabs.remove(ids);
     return 0;
@@ -190,7 +200,8 @@ function normalizeBatch(raw, id, fallbackArchivedAt) {
   if (!isObject(raw) || !Array.isArray(raw.windows)) return null;
   const seen = new Set();
   const idFor = (value, fallback) => {
-    const chosen = validId(value) && !seen.has(value) ? value : fallback;
+    let chosen = validId(value) && !seen.has(value) ? value : fallback;
+    for (let n = 1; seen.has(chosen); n += 1) chosen = `${fallback}~${n}`;
     seen.add(chosen);
     return chosen;
   };
@@ -246,6 +257,18 @@ function normalizeTabs(raw, idBase, idFor) {
     .filter(Boolean);
 }
 
+function contentId(value) {
+  const text = JSON.stringify(value) ?? '';
+  let a = 0x811c9dc5;
+  let b = 0;
+  for (let index = 0; index < text.length; index += 1) {
+    const code = text.charCodeAt(index);
+    a = Math.imul(a ^ code, 16777619);
+    b = (Math.imul(b, 31) + code) | 0;
+  }
+  return `import-${(a >>> 0).toString(36)}${(b >>> 0).toString(36)}`;
+}
+
 const isObject = (value) => typeof value === 'object' && value !== null && !Array.isArray(value);
 const arrayOf = (value) => (Array.isArray(value) ? value : []);
 const stringOr = (value, fallback) => (typeof value === 'string' ? value : fallback);
@@ -259,11 +282,11 @@ function countTabs(batch) {
 
 /* -------------------------------------------------------------- mutations */
 
-/**
- * Re-reads the batch, drops the given tabs and any group or window they leave
- * empty, and removes the batch key once no tab is left.
- */
-export async function removeArchivedTabs(batchId, tabIds) {
+export function removeArchivedTabs(batchId, tabIds) {
+  return withBatchLock(batchId, () => dropTabs(batchId, tabIds));
+}
+
+async function dropTabs(batchId, tabIds) {
   const key = keyOf(batchId);
   const batch = normalizeBatch((await chrome.storage.local.get(key))[key], batchId, 0);
   if (!batch) return;
@@ -287,16 +310,26 @@ export async function removeArchivedTabs(batchId, tabIds) {
   }
 }
 
-export async function reopenArchivedTab(tab) {
-  await chrome.tabs.create({ url: tab.url, active: true });
-  await removeArchivedTabs(tab.batchId, [tab.id]);
+export function reopenArchivedTab(tab) {
+  return withBatchLock(tab.batchId, async () => {
+    // Another page may have reopened or removed it while this one waited.
+    const key = keyOf(tab.batchId);
+    const batch = normalizeBatch((await chrome.storage.local.get(key))[key], tab.batchId, 0);
+    if (!batch || !toModel(batch).windows.some((win) => win.tabs.some((t) => t.id === tab.id))) return;
+    await chrome.tabs.create({ url: tab.url, active: true });
+    await dropTabs(tab.batchId, [tab.id]);
+  });
 }
 
 /**
  * Reopens a batch, one browser window per archived window. Only tabs that
  * were created leave the archive; a tab that fails to open stays in it.
  */
-export async function restoreBatch(batchId) {
+export function restoreBatch(batchId) {
+  return withBatchLock(batchId, () => restoreLocked(batchId));
+}
+
+async function restoreLocked(batchId) {
   const key = keyOf(batchId);
   const stored = normalizeBatch((await chrome.storage.local.get(key))[key], batchId, 0);
   if (!stored) return { restored: 0, failed: 0, windows: 0 };
@@ -345,7 +378,7 @@ export async function restoreBatch(batchId) {
     if (windowId !== null) await regroup(win, created, windowId);
   }
 
-  await removeArchivedTabs(batchId, restored);
+  await dropTabs(batchId, restored);
   return { restored: restored.length, failed, windows };
 }
 
@@ -364,8 +397,8 @@ async function regroup(win, created, windowId) {
   }
 }
 
-export async function deleteBatch(batchId) {
-  await chrome.storage.local.remove(keyOf(batchId));
+export function deleteBatch(batchId) {
+  return withBatchLock(batchId, () => chrome.storage.local.remove(keyOf(batchId)));
 }
 
 /* ------------------------------------------------------- export and import */
@@ -382,7 +415,8 @@ export async function exportArchive() {
 
 /**
  * Adds the batches from a backup file. A batch whose id is already in the
- * archive is skipped, so importing the same file twice changes nothing.
+ * archive is skipped, and a batch without an id gets one derived from its
+ * content, so importing the same file twice changes nothing.
  */
 export async function importArchive(text) {
   let data;
@@ -405,7 +439,7 @@ export async function importArchive(text) {
   const result = { batches: 0, tabs: 0, skipped: 0, invalid: 0 };
 
   for (const raw of data.archive) {
-    const id = validId(raw?.id) ? raw.id : crypto.randomUUID();
+    const id = validId(raw?.id) ? raw.id : contentId(raw);
     if (taken.has(keyOf(id))) {
       result.skipped += 1;
       continue;
