@@ -95,6 +95,7 @@ function updateGroups(change) {
 
 const withoutDomain = (group, domain) => ({ ...group, domains: group.domains.filter((entry) => entry !== domain) });
 
+/** Appends a group, taking its domains out of any other group. */
 export function createGroup({ label, domains = [], keywords = [] }) {
   const id = crypto.randomUUID();
   const domainSet = new Set(normalizeDomains(domains));
@@ -106,7 +107,7 @@ export function createGroup({ label, domains = [], keywords = [] }) {
       ...groups.map((group) => ({ ...group, domains: group.domains.filter((entry) => !domainSet.has(entry)) })),
       { id, label, color, domains: [...domainSet], keywords },
     ];
-  }).then(() => id);
+  });
 }
 
 export function editGroup(id, patch) {

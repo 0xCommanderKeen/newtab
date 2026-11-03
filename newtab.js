@@ -10,6 +10,7 @@ import {
   editGroup,
   loadGroups,
   moveGroup,
+  normalizeDomain,
   unassignDomain,
 } from './custom-groups.js';
 import {
@@ -202,6 +203,8 @@ function init() {
   els.archiveImportFile = document.getElementById('archive-import-file');
   els.banner = document.getElementById('banner');
   els.footerHint = document.getElementById('footer-hint');
+  els.groupsOpen = document.getElementById('groups-open');
+  els.groupsPanel = document.getElementById('groups-panel');
 
   if (!globalThis.chrome?.tabs?.query || !globalThis.chrome?.windows?.getAll) {
     renderUnsupported();
@@ -213,6 +216,7 @@ function init() {
   bindSearch();
   bindViewSwitch();
   bindArchiveControls();
+  bindCustomGroups();
   applyViewButtons();
 
   requestTimeSync()
@@ -507,6 +511,24 @@ function bindSearch() {
   document.addEventListener('keydown', (event) => {
     if (event.defaultPrevented) return;
 
+    if (event.key === 'Escape' && state.menu) {
+      event.preventDefault();
+      closeMenu({ focusButton: true });
+      return;
+    }
+
+    if (event.key === 'Escape' && state.confirmDeleteGroupId) {
+      event.preventDefault();
+      cancelGroupDelete();
+      return;
+    }
+
+    if (event.key === 'Escape' && state.panelOpen) {
+      event.preventDefault();
+      closeGroupsPanel();
+      return;
+    }
+
     if (event.key === 'Escape' && state.prompt?.kind === 'confirm') {
       event.preventDefault();
       dismissPrompt();
@@ -595,6 +617,7 @@ function switchSource(source) {
   if (!SOURCE_NAMES.has(source) || source === state.source) return;
   state.source = source;
   state.confirmDeleteBatchId = null;
+  state.menu = null;
   saveValue(SOURCE_KEY, source);
   applyViewButtons();
   render();
@@ -609,6 +632,7 @@ function render() {
   const ctx = sourceContext(state.source);
   renderControls();
   renderBanner();
+  renderGroupsPanel();
 
   if (state.loading) {
     els.summary.textContent = 'Reading your tabs…';
@@ -675,7 +699,7 @@ function renderControls() {
     : `Save ${plural(count, 'tab')} to the archive and close them`;
 
   els.archiveTools.hidden = state.source !== 'archive';
-  els.archiveExport.disabled = busy || archived === 0;
+  els.archiveExport.disabled = busy || (archived === 0 && state.customGroups.length === 0);
   els.archiveImport.disabled = busy;
 
   els.footerHint.textContent = state.source === 'archive'
@@ -892,7 +916,7 @@ function renderEmptySearch(totalTabs, ctx) {
   els.summary.textContent = matchSummary(0, totalTabs, ctx.tabNoun);
 }
 
-const FOCUS_SCOPES = ['data-tab-id', 'data-group-id', 'data-category-id', 'data-batch-id'];
+const FOCUS_SCOPES = ['data-tab-id', 'data-custom-group-id', 'data-group-id', 'data-category-id', 'data-batch-id'];
 
 // Every render rebuilds the overview, so focus is remembered as a selector and
 // put back on the equivalent new element.
@@ -1206,6 +1230,8 @@ function renderTab(tab, ctx, options = {}) {
   close.addEventListener('click', () => actions.dismiss(tab));
 
   card.append(main, close);
+  const host = groupableHost(tab.url);
+  if (host && EXTENSION_STORAGE) appendTabMenu(card, `${ctx.source}:${tab.id}`, tab.id, host);
   if (actions.middleClick) {
     card.addEventListener('auxclick', (event) => {
       if (event.button === 1) {
@@ -1502,13 +1528,14 @@ async function importArchiveFile(file) {
   if (isBusy()) return;
   let result;
   try {
-    const { batches, tabs, skipped, invalid } = await importArchive(await file.text());
+    const { batches, tabs, skipped, invalid, groups, groupsSkipped } = await importArchive(await file.text());
     const notes = [];
     if (skipped > 0) notes.push(`${plural(skipped, 'batch', 'batches')} already in the archive were skipped.`);
     if (invalid > 0) notes.push(`${plural(invalid, 'batch', 'batches')} had no tabs that can be reopened.`);
+    if (groupsSkipped > 0) notes.push(`Skipped ${plural(groupsSkipped, 'group')} you already have.`);
     result = {
       kind: 'result',
-      text: `Imported ${plural(batches, 'batch', 'batches')}, ${plural(tabs, 'tab')}`,
+      text: `Imported ${plural(batches, 'batch', 'batches')}, ${plural(tabs, 'tab')}, ${plural(groups, 'group')}`,
       detail: notes.join(' '),
       tone: '',
     };
@@ -1516,7 +1543,380 @@ async function importArchiveFile(file) {
     result = { kind: 'result', text: 'Nothing was imported', detail: error?.message || '', tone: 'error' };
   }
   state.prompt = result;
-  await refresh(['archive']);
+  await refresh(['archive', 'groups']);
+}
+
+/* ----------------------------------------------------------- custom groups */
+
+function groupableHost(url) {
+  try {
+    const parsed = new URL(url);
+    return /^https?:$/.test(parsed.protocol) ? normalizeDomain(parsed.hostname) : null;
+  } catch {
+    return null;
+  }
+}
+
+function bindCustomGroups() {
+  els.groupsOpen.hidden = !EXTENSION_STORAGE;
+  els.groupsPanel.hidden = true;
+  if (!EXTENSION_STORAGE) return;
+  els.groupsOpen.addEventListener('click', () => (state.panelOpen ? closeGroupsPanel() : openGroupsPanel()));
+  // mousedown, not click: closing must not rebuild the page under a click
+  // that is about to land on another card.
+  document.addEventListener('mousedown', (event) => {
+    if (state.menu && !event.target.closest?.('.tab-menu, .tab-menu-button')) closeMenu();
+  });
+}
+
+// Mutations resolve with the stored groups, so the page updates even when
+// storage reports no change (a save that normalized to the same value).
+async function changeGroups(change) {
+  try {
+    const groups = await change();
+    state.customGroups = groups;
+    state.groupRules = compileCustomGroups(groups);
+    render();
+    return groups;
+  } catch (error) {
+    console.error('Tab Overview: could not save custom groups', error);
+    state.prompt = { kind: 'result', text: 'Could not save your custom groups', detail: error?.message || '', tone: 'error' };
+    render();
+    return null;
+  }
+}
+
+const groupOf = (host) => state.customGroups.find((group) => group.domains.includes(host));
+const menuButtonSelector = (tabId) => `[data-tab-id="${CSS.escape(String(tabId))}"] .tab-menu-button`;
+
+function appendTabMenu(card, key, tabId, host) {
+  const open = state.menu?.key === key;
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.className = 'tab-menu-button';
+  button.title = 'Custom group';
+  button.setAttribute('aria-label', `Put ${host} in a custom group`);
+  button.setAttribute('aria-haspopup', 'true');
+  button.setAttribute('aria-expanded', String(open));
+  button.append(createIcon(ICONS.more));
+  button.addEventListener('click', () => toggleMenu({ key, tabId, host }));
+  card.append(button);
+
+  if (!open) return;
+  card.classList.add('has-menu');
+  card.append(renderTabMenu(host));
+}
+
+function renderTabMenu(host) {
+  const menu = el('div', 'tab-menu');
+  menu.setAttribute('role', 'group');
+  menu.setAttribute('aria-label', `Custom group for ${host}`);
+  menu.addEventListener('auxclick', (event) => event.stopPropagation());
+
+  const title = el('div', 'tab-menu-title');
+  title.textContent = `Put ${host} in…`;
+  menu.append(title);
+
+  const current = groupOf(host);
+  for (const group of state.customGroups) {
+    const item = menuItem(group.label, () => changeGroups(() => assignDomain(host, group.id))
+      .then(() => closeMenu({ focusButton: true })), 'tab-menu-group');
+    item.dataset.groupId = group.id;
+    const dot = el('span', 'tab-menu-dot');
+    dot.dataset.color = group.color;
+    item.prepend(dot);
+    if (group === current) {
+      item.disabled = true;
+      item.setAttribute('aria-current', 'true');
+      item.title = `${host} is in ${group.label}`;
+    }
+    menu.append(item);
+  }
+
+  if (state.menu.naming) {
+    const row = el('div', 'tab-menu-naming');
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.className = 'tab-menu-input';
+    input.placeholder = 'Group name';
+    input.setAttribute('aria-label', 'New group name');
+    input.maxLength = 80;
+    input.value = state.menu.draft;
+    input.addEventListener('input', () => { state.menu.draft = input.value; });
+    input.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter') {
+        event.preventDefault();
+        createGroupFromMenu(host);
+      } else if (event.key === 'Escape') {
+        event.preventDefault();
+        state.menu.naming = false;
+        render();
+        document.querySelector('.tab-menu .tab-menu-new')?.focus();
+      }
+    });
+    row.append(input, menuItem('Create', () => createGroupFromMenu(host), 'tab-menu-create'));
+    menu.append(row);
+  } else {
+    menu.append(menuItem('New group…', () => {
+      state.menu.naming = true;
+      render();
+      document.querySelector('.tab-menu .tab-menu-input')?.focus();
+    }, 'tab-menu-new'));
+  }
+
+  if (current) {
+    menu.append(el('div', 'tab-menu-divider'));
+    menu.append(menuItem(`Remove from ${current.label}`, () => changeGroups(() => unassignDomain(host, current.id))
+      .then(() => closeMenu({ focusButton: true })), 'tab-menu-remove'));
+  }
+
+  return menu;
+}
+
+function menuItem(label, onClick, className) {
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.className = `tab-menu-item ${className}`;
+  const text = el('span', 'tab-menu-label');
+  text.textContent = label;
+  button.append(text);
+  button.addEventListener('click', onClick);
+  return button;
+}
+
+function toggleMenu(menu) {
+  if (state.menu?.key === menu.key) {
+    closeMenu({ focusButton: true });
+    return;
+  }
+  state.menu = { ...menu, naming: false, draft: '' };
+  render();
+  document.querySelector('.tab-menu .tab-menu-item:not(:disabled)')?.focus();
+}
+
+async function createGroupFromMenu(host) {
+  const label = state.menu?.draft.trim();
+  if (!label) {
+    document.querySelector('.tab-menu .tab-menu-input')?.focus();
+    return;
+  }
+  await changeGroups(() => createGroup({ label, domains: [host] }));
+  closeMenu({ focusButton: true });
+}
+
+// Takes the menu out of the page without a full render, so a click that
+// started outside the menu still reaches its target.
+function closeMenu({ focusButton = false } = {}) {
+  const tabId = state.menu?.tabId;
+  state.menu = null;
+  for (const node of document.querySelectorAll('.tab-menu')) node.remove();
+  for (const card of document.querySelectorAll('.tab.has-menu')) {
+    card.classList.remove('has-menu');
+    card.querySelector('.tab-menu-button')?.setAttribute('aria-expanded', 'false');
+  }
+  if (focusButton && tabId !== undefined) document.querySelector(menuButtonSelector(tabId))?.focus();
+}
+
+function openGroupsPanel() {
+  state.panelOpen = true;
+  render();
+  focusFirst(['#groups-panel .group-edit-label', '#groups-add']);
+}
+
+function closeGroupsPanel() {
+  state.panelOpen = false;
+  state.confirmDeleteGroupId = null;
+  render();
+  els.groupsOpen.focus();
+}
+
+function renderGroupsPanel() {
+  if (!EXTENSION_STORAGE) return;
+  els.groupsOpen.setAttribute('aria-expanded', String(state.panelOpen));
+  els.groupsOpen.classList.toggle('is-active', state.panelOpen);
+  els.groupsPanel.hidden = !state.panelOpen;
+  if (!state.panelOpen) {
+    els.groupsPanel.replaceChildren();
+    return;
+  }
+
+  const draft = captureDraft();
+  const card = el('div', 'groups-card');
+
+  const head = el('div', 'groups-head');
+  const heading = document.createElement('h2');
+  heading.id = 'groups-title';
+  heading.textContent = 'Custom groups';
+  const actions = el('div', 'groups-actions');
+  const add = createButton('New group', addGroupFromPanel);
+  add.id = 'groups-add';
+  const close = createButton('Close', closeGroupsPanel, 'is-primary');
+  close.id = 'groups-close';
+  actions.append(add, close);
+  head.append(heading, actions);
+
+  const intro = el('p', 'groups-intro');
+  intro.textContent = 'In the Sorted view, tabs from a group’s domains go to that group, ahead of the ' +
+    'built-in categories. A domain also covers its subdomains; add a path, like github.com/your-org, ' +
+    'to match only part of a site. Keywords match whole words in the title or address. ' +
+    'Export and Import on the Archive view include your groups.';
+
+  card.append(head, intro);
+
+  if (state.customGroups.length === 0) {
+    const empty = el('p', 'groups-empty');
+    empty.textContent = 'No custom groups yet. Add one here, or use the ⋯ button on any tab.';
+    card.append(empty);
+  } else {
+    const list = el('ol', 'groups-list');
+    state.customGroups.forEach((group, index) => list.append(renderGroupEditor(group, index)));
+    card.append(list);
+  }
+
+  els.groupsPanel.replaceChildren(card);
+  restoreDraft(draft);
+}
+
+function renderGroupEditor(group, index) {
+  const item = el('li', 'group-editor');
+  item.dataset.customGroupId = group.id;
+  item.dataset.color = group.color;
+
+  const head = el('div', 'group-editor-head');
+  const dot = el('span', 'group-dot');
+
+  const label = document.createElement('input');
+  label.type = 'text';
+  label.className = 'group-edit-label';
+  label.value = group.label;
+  label.maxLength = 80;
+  label.setAttribute('aria-label', 'Group name');
+  label.addEventListener('change', () => changeGroups(() => editGroup(group.id, { label: label.value })));
+  label.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter') label.blur();
+  });
+
+  const colors = el('div', 'group-edit-color');
+  colors.setAttribute('role', 'group');
+  colors.setAttribute('aria-label', 'Color');
+  for (const color of GROUP_COLORS) {
+    const swatch = document.createElement('button');
+    swatch.type = 'button';
+    swatch.className = 'color-swatch';
+    swatch.dataset.color = color;
+    swatch.title = color;
+    swatch.setAttribute('aria-label', color);
+    swatch.setAttribute('aria-pressed', String(color === group.color));
+    swatch.addEventListener('click', () => changeGroups(() => editGroup(group.id, { color })));
+    colors.append(swatch);
+  }
+
+  const actions = el('div', 'group-editor-actions');
+  if (state.confirmDeleteGroupId === group.id) {
+    const question = el('span', 'group-delete-question');
+    question.textContent = `Delete ${group.label}?`;
+    actions.append(
+      question,
+      createButton('Delete', () => {
+        state.confirmDeleteGroupId = null;
+        changeGroups(() => deleteGroup(group.id)).then(() => focusFirst(['#groups-add']));
+      }, 'is-danger group-delete-confirm'),
+      createButton('Cancel', cancelGroupDelete, 'group-delete-cancel'),
+    );
+  } else {
+    const up = createButton('↑', () => moveCustomGroup(group.id, -1), 'icon-button group-move-up');
+    up.disabled ||= index === 0;
+    up.setAttribute('aria-label', `Move ${group.label} up`);
+    const down = createButton('↓', () => moveCustomGroup(group.id, 1), 'icon-button group-move-down');
+    down.disabled ||= index === state.customGroups.length - 1;
+    down.setAttribute('aria-label', `Move ${group.label} down`);
+    const remove = createButton('Delete', () => {
+      state.confirmDeleteGroupId = group.id;
+      render();
+      document.querySelector(`[data-custom-group-id="${CSS.escape(group.id)}"] .group-delete-cancel`)?.focus();
+    }, 'group-delete');
+    actions.append(up, down, remove);
+  }
+
+  head.append(dot, label, colors, actions);
+
+  const fields = el('div', 'group-editor-fields');
+  fields.append(
+    listField('Domains', 'group-edit-domains', group.domains, 'example.com\ngithub.com/your-org',
+      (domains) => editGroup(group.id, { domains })),
+    listField('Keywords', 'group-edit-keywords', group.keywords, 'invoice\nquarterly report',
+      (keywords) => editGroup(group.id, { keywords })),
+  );
+
+  item.append(head, fields);
+  return item;
+}
+
+function listField(title, className, values, placeholder, save) {
+  const wrap = el('label', 'group-field');
+  const name = el('span', 'group-field-name');
+  name.textContent = `${title} · one per line`;
+  const area = document.createElement('textarea');
+  area.className = className;
+  area.rows = Math.min(8, Math.max(3, values.length + 1));
+  area.spellcheck = false;
+  area.placeholder = placeholder;
+  area.value = values.join('\n');
+  area.addEventListener('change', () => changeGroups(() => save(area.value.split('\n'))));
+  wrap.append(name, area);
+  return wrap;
+}
+
+async function addGroupFromPanel() {
+  const groups = await changeGroups(() => createGroup({ label: 'New group' }));
+  const created = groups?.at(-1);
+  if (!created) return;
+  const input = document.querySelector(`[data-custom-group-id="${CSS.escape(created.id)}"] .group-edit-label`);
+  input?.focus();
+  input?.select();
+}
+
+async function moveCustomGroup(id, offset) {
+  await changeGroups(() => moveGroup(id, offset));
+  const editor = `[data-custom-group-id="${CSS.escape(id)}"]`;
+  if (document.activeElement === document.body || !els.groupsPanel.contains(document.activeElement)) {
+    focusFirst([
+      `${editor} ${offset < 0 ? '.group-move-up' : '.group-move-down'}:not(:disabled)`,
+      `${editor} .group-move-up:not(:disabled)`,
+      `${editor} .group-move-down:not(:disabled)`,
+    ]);
+  }
+}
+
+function cancelGroupDelete() {
+  const id = state.confirmDeleteGroupId;
+  state.confirmDeleteGroupId = null;
+  render();
+  focusFirst([`[data-custom-group-id="${CSS.escape(id)}"] .group-delete`, '#groups-add']);
+}
+
+// The panel is rebuilt on every render; the field being typed in keeps its
+// unsaved text and caret, since it only saves when it loses focus.
+function captureDraft() {
+  const active = document.activeElement;
+  if (!(active instanceof HTMLInputElement || active instanceof HTMLTextAreaElement)) return null;
+  const editor = active.closest('[data-custom-group-id]');
+  if (!editor || !els.groupsPanel.contains(editor)) return null;
+  return {
+    selector: `[data-custom-group-id="${CSS.escape(editor.dataset.customGroupId)}"] .${active.classList[0]}`,
+    value: active.value,
+    start: active.selectionStart,
+    end: active.selectionEnd,
+  };
+}
+
+function restoreDraft(draft) {
+  if (!draft) return;
+  const field = els.groupsPanel.querySelector(draft.selector);
+  if (!field) return;
+  field.value = draft.value;
+  field.focus({ preventScroll: true });
+  field.setSelectionRange(draft.start, draft.end);
 }
 
 function toggleGroup(ctx, groupId) {
