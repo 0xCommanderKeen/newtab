@@ -153,7 +153,7 @@ const state = {
     archive: loadSet(ARCHIVE_COLLAPSED_KEY, toStringId),
   },
   collapsedCategories: loadSet(COLLAPSED_CATEGORIES_KEY, toStringId),
-  // null | { kind: 'confirm', count, skipped } | { kind: 'busy', text }
+  // null | { kind: 'confirm' } | { kind: 'busy', text }
   //      | { kind: 'result', text, detail, tone }
   prompt: null,
   confirmDeleteBatchId: null,
@@ -264,6 +264,11 @@ async function loadArchiveState() {
     }
     state.batches = batches;
     state.archiveError = null;
+    const live = new Set(batches.flatMap((batch) =>
+      batch.windows.flatMap((win) => win.tabs.map(archivedTabKey))));
+    for (const key of pendingArchivedTabs) {
+      if (!live.has(key)) pendingArchivedTabs.delete(key);
+    }
     pruneCollapsed('archive', batches.flatMap((batch) => batch.windows));
   } catch (error) {
     console.error('Tab Overview: failed to read the archive', error);
@@ -425,11 +430,17 @@ function bindSearch() {
   });
 
   document.addEventListener('keydown', (event) => {
-    if (event.key === 'Escape' && (state.prompt?.kind === 'confirm' || state.confirmDeleteBatchId)) {
+    if (event.defaultPrevented) return;
+
+    if (event.key === 'Escape' && state.prompt?.kind === 'confirm') {
       event.preventDefault();
-      if (state.prompt?.kind === 'confirm') state.prompt = null;
-      state.confirmDeleteBatchId = null;
-      render();
+      dismissPrompt();
+      return;
+    }
+
+    if (event.key === 'Escape' && state.confirmDeleteBatchId) {
+      event.preventDefault();
+      cancelBatchDelete(state.confirmDeleteBatchId);
       return;
     }
 
@@ -490,8 +501,6 @@ function applyViewButtons() {
 
 function bindArchiveControls() {
   els.sourceSwitch.hidden = !ARCHIVE_AVAILABLE;
-  els.archiveAll.hidden = !ARCHIVE_AVAILABLE;
-  els.archiveTools.hidden = !ARCHIVE_AVAILABLE;
   if (!ARCHIVE_AVAILABLE) return;
 
   for (const button of els.sourceButtons) {
@@ -599,15 +608,21 @@ function renderControls() {
     : 'Click a tab to switch to it';
 }
 
+// The confirm prompt recounts on every render, so tabs opened or closed while
+// it is showing are reflected before the user confirms.
 const BANNERS = {
-  confirm: (prompt) => ({
-    text: `Archive and close ${plural(prompt.count, 'tab')}?`,
-    detail: leftOpenText(prompt.skipped, 'stay open'),
-    buttons: [
+  confirm: () => {
+    const plan = planArchive(state.windows);
+    if (plan.count === 0) return null;
+    return {
+      text: `Archive and close ${plural(plan.count, 'tab')}?`,
+      detail: leftOpenText(plan.skipped, 'stay open'),
+      buttons: [
       { id: 'archive-confirm', label: 'Archive and close', primary: true, onClick: confirmArchiveAll },
-      { id: 'archive-cancel', label: 'Cancel', onClick: dismissPrompt },
-    ],
-  }),
+        { id: 'archive-cancel', label: 'Cancel', onClick: dismissPrompt },
+      ],
+    };
+  },
   busy: (prompt) => ({ text: prompt.text, buttons: [] }),
   result: (prompt) => ({
     text: prompt.text,
@@ -618,6 +633,8 @@ const BANNERS = {
 };
 
 function renderBanner() {
+  const view = state.prompt && BANNERS[state.prompt.kind](state.prompt);
+  if (!view) state.prompt = null;
   const prompt = state.prompt;
   els.banner.hidden = !prompt;
   if (!prompt) {
@@ -625,7 +642,6 @@ function renderBanner() {
     return;
   }
 
-  const view = BANNERS[prompt.kind](prompt);
   const banner = el('div', 'banner');
   banner.dataset.kind = prompt.kind;
   if (view.tone) banner.dataset.tone = view.tone;
@@ -655,6 +671,17 @@ function dismissPrompt() {
   if (isBusy()) return;
   state.prompt = null;
   render();
+  focusFirst(['#archive-all:not([hidden]):not(:disabled)', '#search']);
+}
+
+function focusFirst(selectors) {
+  for (const selector of selectors) {
+    const target = document.querySelector(selector);
+    if (target) {
+      target.focus({ preventScroll: true });
+      return;
+    }
+  }
 }
 
 function createButton(label, onClick, modifier = '') {
@@ -716,10 +743,7 @@ function renderBatch(batch, sections, count, ctx) {
     actions.append(
       question,
       createButton('Delete', () => deleteArchivedBatch(batch), 'is-danger batch-delete-confirm'),
-      createButton('Cancel', () => {
-        state.confirmDeleteBatchId = null;
-        render();
-      }, 'batch-delete-cancel'),
+      createButton('Cancel', () => cancelBatchDelete(batch.id), 'batch-delete-cancel'),
     );
   } else {
     const restore = createButton('Restore', () => restoreArchivedBatch(batch), 'batch-restore');
@@ -740,6 +764,12 @@ function renderBatch(batch, sections, count, ctx) {
   section.append(head);
   for (const windowSection of sections) section.append(renderWindow(windowSection, ctx));
   return section;
+}
+
+function cancelBatchDelete(batchId) {
+  state.confirmDeleteBatchId = null;
+  render();
+  focusFirst([`[data-batch-id="${CSS.escape(batchId)}"] .batch-delete`, '#search']);
 }
 
 function renderWindowView(ctx) {
@@ -1259,9 +1289,8 @@ async function closeTab(tab) {
 
 function promptArchiveAll() {
   if (isBusy()) return;
-  const plan = planArchive(state.windows);
-  if (plan.count === 0) return;
-  state.prompt = { kind: 'confirm', count: plan.count, skipped: plan.skipped };
+  if (planArchive(state.windows).count === 0) return;
+  state.prompt = { kind: 'confirm' };
   render();
   document.getElementById('archive-confirm')?.focus();
 }
@@ -1278,7 +1307,8 @@ async function confirmArchiveAll() {
     const { archived, closeFailed } = await archivePlan(plan);
     const notes = [leftOpenText(plan.skipped, 'left open')];
     if (closeFailed > 0) {
-      notes.push(`${plural(closeFailed, 'archived tab')} could not be closed.`);
+      notes.push(`${plural(closeFailed, 'archived tab')} changed or could not be closed and ` +
+        `${closeFailed === 1 ? 'is' : 'are'} still open.`);
     }
     result = {
       kind: 'result',
@@ -1303,6 +1333,7 @@ async function confirmArchiveAll() {
 
   state.prompt = result;
   await refresh();
+  focusFirst(['#banner-dismiss']);
 }
 
 async function restoreArchivedBatch(batch) {
@@ -1315,7 +1346,9 @@ async function restoreArchivedBatch(batch) {
     const { restored, failed, windows } = await restoreBatch(batch.id);
     result = {
       kind: 'result',
-      text: `Restored ${plural(restored, 'tab')} in ${plural(windows, 'window')}`,
+      text: restored + failed === 0
+        ? 'This batch was already restored or deleted'
+        : `Restored ${plural(restored, 'tab')} in ${plural(windows, 'window')}`,
       detail: failed > 0 ? `${plural(failed, 'tab')} could not be opened and stay in the archive.` : '',
       tone: failed > 0 ? 'warn' : '',
     };
@@ -1326,6 +1359,7 @@ async function restoreArchivedBatch(batch) {
 
   state.prompt = result;
   await refresh();
+  focusFirst(['#banner-dismiss']);
 }
 
 async function deleteArchivedBatch(batch) {
@@ -1338,6 +1372,7 @@ async function deleteArchivedBatch(batch) {
     state.prompt = { kind: 'result', text: 'Could not delete the batch', detail: error?.message || '', tone: 'error' };
   }
   await refresh(['archive']);
+  focusFirst(['#banner-dismiss', '#search']);
 }
 
 async function openArchivedTab(tab) {
@@ -1349,18 +1384,23 @@ async function deleteArchivedTab(tab) {
     'could not remove archived tab');
 }
 
-// A second click while the first is still writing would open the page twice.
+// The card stays on screen until the next archive load; until then a second
+// click would act on the same tab again.
 async function changeArchivedTab(tab, change, failure) {
-  if (isBusy() || pendingArchivedTabs.has(tab.id)) return;
-  pendingArchivedTabs.add(tab.id);
+  const key = archivedTabKey(tab);
+  if (isBusy() || pendingArchivedTabs.has(key)) return;
+  pendingArchivedTabs.add(key);
   try {
     await change(tab);
   } catch (error) {
+    pendingArchivedTabs.delete(key);
     console.warn(`Tab Overview: ${failure}`, error);
-  } finally {
-    pendingArchivedTabs.delete(tab.id);
-    scheduleRefresh('archive');
   }
+  scheduleRefresh('archive');
+}
+
+function archivedTabKey(tab) {
+  return `${tab.batchId}:${tab.id}`;
 }
 
 async function downloadArchive() {
