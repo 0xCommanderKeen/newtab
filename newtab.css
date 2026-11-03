@@ -857,6 +857,7 @@ textarea {
 }
 
 .section-archive,
+.section-suspend,
 .section-edit {
   display: grid;
   place-items: center;
@@ -872,11 +873,13 @@ textarea {
   transition: opacity 0.12s ease, background-color 0.12s ease, color 0.12s ease;
 }
 
-.section-archive {
+.section-archive,
+.section-suspend {
   opacity: 0;
 }
 
 .section-archive svg,
+.section-suspend svg,
 .section-edit svg {
   display: block;
   width: 16px;
@@ -898,37 +901,87 @@ textarea {
   outline-offset: -1px;
 }
 
-/* A group without tabs has no archive button; keep its pencil in line with
-   the pencils that have one beside them. */
+/* A group without tabs has no archive button, and one without open tabs no
+   suspend button; keep its pencil in line with the pencils that have them. */
 .overview:has(.section-archive) .section-edit:last-child {
   margin-right: 32px;
 }
 
-.group-header-row:hover .section-archive,
-.group-header-row:focus-within .section-archive,
-.window-head:hover .section-archive,
-.window-head:focus-within .section-archive,
-.section-archive:focus-visible {
+.overview:has(.section-suspend) .section-edit:last-child {
+  margin-right: 64px;
+}
+
+.overview:has(.section-suspend) .section-edit + .section-archive {
+  margin-left: 32px;
+}
+
+.group-header-row:hover :is(.section-archive, .section-suspend),
+.group-header-row:focus-within :is(.section-archive, .section-suspend),
+.window-head:hover :is(.section-archive, .section-suspend),
+.window-head:focus-within :is(.section-archive, .section-suspend),
+.section-archive:focus-visible,
+.section-suspend:focus-visible {
   opacity: 1;
 }
 
-.section-archive:hover:not(:disabled) {
+.section-archive:hover:not(:disabled),
+.section-suspend:hover:not(:disabled) {
   background: var(--bg-soft);
   color: var(--text);
 }
 
-.section-archive:focus-visible {
+.section-archive:focus-visible,
+.section-suspend:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: -1px;
 }
 
-.section-archive:disabled {
+.section-archive:disabled,
+.section-suspend:disabled {
   cursor: default;
 }
 
-.window-archive {
+.window-archive,
+.window-suspend {
   width: 26px;
   height: 26px;
+}
+
+.section-reopen {
+  flex: none;
+  height: 24px;
+  padding: 0 9px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--bg-elev);
+  color: var(--text-2);
+  font-size: 11.5px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: background-color 0.12s ease, border-color 0.12s ease, color 0.12s ease;
+}
+
+.section-reopen:hover:not(:disabled) {
+  border-color: var(--accent-border);
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.section-reopen:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.section-reopen:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.window.is-suspended .window-dot {
+  background: transparent;
+  box-shadow: inset 0 0 0 1.5px var(--text-3);
 }
 
 .group-dot {
@@ -1009,6 +1062,30 @@ textarea {
 .tab.is-discarded:hover,
 .tab.is-discarded:focus-visible {
   opacity: 0.8;
+}
+
+/* Closed in the browser: dimmed, with a dashed edge so it reads apart from a
+   sleeping tab, but its buttons stay at full strength. */
+.tab.is-suspended {
+  outline: 1px dashed var(--border-strong);
+  outline-offset: -1px;
+}
+
+.tab.is-suspended .tab-favicon,
+.tab.is-suspended .tab-text {
+  opacity: 0.55;
+  transition: opacity 0.12s ease;
+}
+
+.tab.is-suspended .tab-favicon {
+  filter: grayscale(1);
+}
+
+.tab.is-suspended:hover .tab-favicon,
+.tab.is-suspended:hover .tab-text,
+.tab.is-suspended:focus-within .tab-favicon,
+.tab.is-suspended:focus-within .tab-text {
+  opacity: 0.85;
 }
 
 .tab-favicon {
@@ -1184,7 +1261,8 @@ textarea {
 @media (hover: none) {
   .tab-close,
   .tab-menu-button,
-  .section-archive {
+  .section-archive,
+  .section-suspend {
     opacity: 0.65;
   }
 }
@@ -1282,6 +1360,13 @@ textarea {
 
 .tab-menu-remove {
   color: var(--danger);
+}
+
+.tab-menu-suspend svg {
+  flex: none;
+  width: 14px;
+  height: 14px;
+  color: var(--text-3);
 }
 
 .tab-menu-divider {
