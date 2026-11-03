@@ -227,6 +227,12 @@ async function refresh(parts = Object.keys(LOADERS)) {
   if (isBusy()) return;
   await Promise.all(parts.map((part) => LOADERS[part]()));
   state.loading = false;
+  if (pointerHeld()) {
+    renderDeferred = true;
+    clearTimeout(refreshTimer);
+    refreshTimer = setTimeout(flushRefresh, 100);
+    return;
+  }
   render();
 }
 
@@ -238,19 +244,29 @@ function scheduleRefresh(part) {
 
 // A render replaces the page's buttons, and a button replaced between mousedown
 // and mouseup never gets the click. Tab events arrive several times a second
-// while pages load, so event-driven refreshes wait until the pointer is
-// released. The 2 s cap covers a release outside the window that never reports.
+// while pages load, so renders wait until the pointer is released. The check
+// sits right before render(), because a refresh started before the press
+// finishes loading during it. The 2 s cap covers a release outside the window
+// that never reports.
 let pointerDownAt = 0;
+let renderDeferred = false;
+
+const pointerHeld = () => pointerDownAt !== 0 && Date.now() - pointerDownAt < 2000;
 
 function flushRefresh() {
-  if (pendingParts.size === 0) return;
-  if (pointerDownAt && Date.now() - pointerDownAt < 2000) {
+  if (pointerHeld()) {
     refreshTimer = setTimeout(flushRefresh, 100);
     return;
   }
-  const parts = [...pendingParts];
-  pendingParts.clear();
-  refresh(parts);
+  if (pendingParts.size > 0) {
+    renderDeferred = false;
+    const parts = [...pendingParts];
+    pendingParts.clear();
+    refresh(parts);
+  } else if (renderDeferred) {
+    renderDeferred = false;
+    render();
+  }
 }
 
 function bindPointerHold() {
