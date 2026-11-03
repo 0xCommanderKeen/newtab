@@ -31,9 +31,9 @@ export function normalizeDomain(value) {
     return null;
   }
   const host = parsed.hostname.replace(/^www\./, '').replace(/\.$/, '');
-  if (!host || (!host.includes('.') && host !== 'localhost')) return null;
-  // Kept percent-encoded, the same form tab URLs are matched in.
-  const path = parsed.pathname.replace(/\/+$/, '');
+  if (!host || host.startsWith('.')) return null;
+  // Lowercased after parsing, so percent-escapes match the lowercased tab path.
+  const path = parsed.pathname.toLowerCase().replace(/\/+$/, '');
   return host + path;
 }
 
@@ -110,8 +110,13 @@ export function createGroup({ label, domains = [], keywords = [] }) {
   });
 }
 
+/** Applies a patch to one group. Domains it gains leave every other group. */
 export function editGroup(id, patch) {
-  return updateGroups((groups) => groups.map((group) => (group.id === id ? { ...group, ...patch, id } : group)));
+  const claimed = new Set(patch.domains ? normalizeDomains(patch.domains) : []);
+  return updateGroups((groups) => groups.map((group) => {
+    if (group.id === id) return { ...group, ...patch, id };
+    return claimed.size === 0 ? group : { ...group, domains: group.domains.filter((entry) => !claimed.has(entry)) };
+  }));
 }
 
 export function deleteGroup(id) {
@@ -147,13 +152,14 @@ export function unassignDomain(domain, groupId) {
  */
 export async function mergeGroups(raw) {
   const incoming = normalizeGroups(raw);
+  const invalid = (Array.isArray(raw) ? raw.length : 0) - incoming.length;
   let added = 0;
-  if (incoming.length === 0) return { added, skipped: 0 };
+  if (incoming.length === 0) return { added, skipped: 0, invalid };
   await updateGroups((groups) => {
     const taken = new Set(groups.map((group) => group.id));
     const fresh = incoming.filter((group) => !taken.has(group.id));
     added = fresh.length;
     return [...groups, ...fresh];
   });
-  return { added, skipped: incoming.length - added };
+  return { added, skipped: incoming.length - added, invalid };
 }

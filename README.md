@@ -120,7 +120,9 @@ Custom groups are checked first, in this order:
 
 Domain entries are cleaned when you save them: letters are lowercased, and
 `https://`, `www.`, and a trailing `/` are removed. Duplicate and empty lines
-are dropped.
+are dropped. Ports are ignored, so `localhost` covers every local port. A
+domain belongs to one group: adding it to a group, from the ⋯ menu or the
+panel, takes it out of any other group.
 
 The built-in categories are decided locally from the tab's hostname and
 title/URL keywords.

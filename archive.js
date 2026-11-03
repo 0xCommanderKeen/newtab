@@ -103,7 +103,7 @@ export async function archivePlan(plan, label = '') {
   const batch = {
     id: crypto.randomUUID(),
     archivedAt: Date.now(),
-    ...(label ? { label } : {}),
+    ...(label.trim() ? { label: label.trim().slice(0, MAX_LABEL_LENGTH) } : {}),
     windows: plan.windows.map((win, index) => ({
       id: crypto.randomUUID(),
       title: `Window ${index + 1}`,
@@ -468,8 +468,9 @@ export async function importArchive(text) {
   }
 
   if (result.batches > 0) await chrome.storage.local.set(additions);
-  const { added, skipped } = await mergeGroups(data.customGroups);
+  const { added, skipped, invalid } = await mergeGroups(data.customGroups);
   result.groups = added;
   result.groupsSkipped = skipped;
+  result.groupsInvalid = invalid;
   return result;
 }

@@ -1170,6 +1170,15 @@ textarea {
   background: var(--group-color, var(--text-3));
 }
 
+.tab-menu-current {
+  padding: 0 8px 6px;
+  overflow: hidden;
+  color: var(--text-2);
+  font-size: 12px;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
 .tab-menu-new {
   color: var(--accent);
 }
@@ -1221,7 +1230,8 @@ textarea {
   padding: 20px 28px 0;
 }
 
-.groups-panel[hidden] {
+.groups-panel[hidden],
+.groups-panel [hidden] {
   display: none;
 }
 

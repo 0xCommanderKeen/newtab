@@ -1,6 +1,6 @@
 'use strict';
 
-import { CATEGORY_INDEX, categorizeTab, compileCustomGroups } from './categories.js';
+import { CATEGORY_INDEX, categorizeTab, compileCustomGroups, matchCustomDomain } from './categories.js';
 import {
   GROUPS_KEY,
   GROUP_COLORS,
@@ -646,6 +646,8 @@ function render() {
 
   els.overview.replaceChildren();
   renderSource(ctx);
+  // The menu's tab closed or left this view.
+  if (state.menu && !els.overview.querySelector('.tab-menu')) state.menu = null;
   restoreFocus(focus);
 }
 
@@ -948,6 +950,7 @@ function renderEmptySearch(totalTabs, ctx) {
   els.summary.textContent = matchSummary(0, totalTabs, ctx.tabNoun);
 }
 
+const FOCUS_KEYS = ['data-group-id', 'data-color'];
 const FOCUS_SCOPES = [
   'data-tab-id', 'data-custom-group-id', 'data-group-id', 'data-category-id', 'data-batch-id', 'data-window-id',
 ];
@@ -965,7 +968,10 @@ function focusKey() {
     const base = `[${attr}="${CSS.escape(scope.getAttribute(attr))}"]`;
     if (scope === active) return base;
     const classes = [...active.classList].map((name) => `.${CSS.escape(name)}`).join('');
-    return classes ? `${base} ${classes}` : null;
+    // Siblings that share classes, like menu items, tell apart by their key.
+    const keys = FOCUS_KEYS.filter((key) => active.hasAttribute(key))
+      .map((key) => `[${key}="${CSS.escape(active.getAttribute(key))}"]`).join('');
+    return classes ? `${base} ${classes}${keys}` : null;
   }
   return null;
 }
@@ -1303,7 +1309,7 @@ function renderTab(tab, ctx, options = {}) {
 
   card.append(main, close);
   const host = groupableHost(tab.url);
-  if (host && EXTENSION_STORAGE) appendTabMenu(card, `${ctx.source}:${tab.id}`, tab.id, host);
+  if (host && EXTENSION_STORAGE) appendTabMenu(card, `${ctx.source}:${tab.id}`, tab.id, host, tab.url);
   if (actions.middleClick) {
     card.addEventListener('auxclick', (event) => {
       if (event.button === 1) {
@@ -1610,11 +1616,13 @@ async function importArchiveFile(file) {
   if (isBusy()) return;
   let result;
   try {
-    const { batches, tabs, skipped, invalid, groups, groupsSkipped } = await importArchive(await file.text());
+    const { batches, tabs, skipped, invalid, groups, groupsSkipped, groupsInvalid } =
+      await importArchive(await file.text());
     const notes = [];
     if (skipped > 0) notes.push(`${plural(skipped, 'batch', 'batches')} already in the archive were skipped.`);
     if (invalid > 0) notes.push(`${plural(invalid, 'batch', 'batches')} had no tabs that can be reopened.`);
     if (groupsSkipped > 0) notes.push(`Skipped ${plural(groupsSkipped, 'group')} you already have.`);
+    if (groupsInvalid > 0) notes.push(`${plural(groupsInvalid, 'group')} without a valid id ${groupsInvalid === 1 ? 'was' : 'were'} left out.`);
     result = {
       kind: 'result',
       text: `Imported ${plural(batches, 'batch', 'batches')}, ${plural(tabs, 'tab')}, ${plural(groups, 'group')}`,
@@ -1671,7 +1679,7 @@ async function changeGroups(change) {
 const groupOf = (host) => state.customGroups.find((group) => group.domains.includes(host));
 const menuButtonSelector = (tabId) => `[data-tab-id="${CSS.escape(String(tabId))}"] .tab-menu-button`;
 
-function appendTabMenu(card, key, tabId, host) {
+function appendTabMenu(card, key, tabId, host, url) {
   const open = state.menu?.key === key;
   const button = document.createElement('button');
   button.type = 'button';
@@ -1686,10 +1694,10 @@ function appendTabMenu(card, key, tabId, host) {
 
   if (!open) return;
   card.classList.add('has-menu');
-  card.append(renderTabMenu(host));
+  card.append(renderTabMenu(host, url));
 }
 
-function renderTabMenu(host) {
+function renderTabMenu(host, url) {
   const menu = el('div', 'tab-menu');
   menu.setAttribute('role', 'group');
   menu.setAttribute('aria-label', `Custom group for ${host}`);
@@ -1700,6 +1708,12 @@ function renderTabMenu(host) {
   menu.append(title);
 
   const current = groupOf(host);
+  const matched = current ? null : matchCustomDomain(url, state.groupRules);
+  if (matched) {
+    const note = el('div', 'tab-menu-current');
+    note.textContent = `In ${matched.category.label} through ${matched.entry}`;
+    menu.append(note);
+  }
   for (const group of state.customGroups) {
     const item = menuItem(group.label, () => changeGroups(() => assignDomain(host, group.id))
       .then(() => closeMenu({ focusButton: true })), 'tab-menu-group');
@@ -1707,10 +1721,10 @@ function renderTabMenu(host) {
     const dot = el('span', 'tab-menu-dot');
     dot.dataset.color = group.color;
     item.prepend(dot);
-    if (group === current) {
+    if (group === current || group.id === matched?.category.groupId) {
       item.disabled = true;
       item.setAttribute('aria-current', 'true');
-      item.title = `${host} is in ${group.label}`;
+      item.title = current ? `${host} is in ${group.label}` : `In ${group.label} through ${matched.entry}`;
     }
     menu.append(item);
   }
@@ -1812,16 +1826,50 @@ function closeGroupsPanel() {
   els.groupsOpen.focus();
 }
 
+// The panel's nodes persist while it is open and are updated in place. A
+// rebuild would remove the field being typed in, which fires its change
+// event early, and the button under a click that started a save.
+const panel = { shell: null, list: null, empty: null, editors: new Map() };
+
 function renderGroupsPanel() {
   if (!EXTENSION_STORAGE) return;
   els.groupsOpen.setAttribute('aria-expanded', String(state.panelOpen));
   els.groupsPanel.hidden = !state.panelOpen;
   if (!state.panelOpen) {
+    panel.shell = null;
+    panel.editors.clear();
     els.groupsPanel.replaceChildren();
     return;
   }
 
-  const draft = captureDraft();
+  if (!panel.shell) buildPanelShell();
+  const busy = isBusy();
+  for (const button of panel.shell.querySelectorAll('.groups-actions .button')) button.disabled = busy;
+
+  const live = new Set(state.customGroups.map((group) => group.id));
+  for (const [id, editor] of panel.editors) {
+    if (live.has(id)) continue;
+    editor.item.remove();
+    panel.editors.delete(id);
+  }
+
+  state.customGroups.forEach((group, index) => {
+    let editor = panel.editors.get(group.id);
+    if (!editor) {
+      editor = createGroupEditor(group.id);
+      panel.editors.set(group.id, editor);
+    }
+    updateGroupEditor(editor, group, index, busy);
+    if (panel.list.children[index] !== editor.item) {
+      panel.list.insertBefore(editor.item, panel.list.children[index] ?? null);
+    }
+  });
+
+  panel.empty.hidden = state.customGroups.length > 0;
+  panel.list.hidden = state.customGroups.length === 0;
+}
+
+function buildPanelShell() {
   const card = el('div', 'groups-card');
 
   const head = el('div', 'groups-head');
@@ -1842,26 +1890,20 @@ function renderGroupsPanel() {
     'to match only part of a site. Keywords match whole words in the title or address. ' +
     'Export and Import on the Archive view include your groups.';
 
-  card.append(head, intro);
+  panel.empty = el('p', 'groups-empty');
+  panel.empty.textContent = 'No custom groups yet. Add one here, or use the ⋯ button on any tab.';
+  panel.list = el('ol', 'groups-list');
 
-  if (state.customGroups.length === 0) {
-    const empty = el('p', 'groups-empty');
-    empty.textContent = 'No custom groups yet. Add one here, or use the ⋯ button on any tab.';
-    card.append(empty);
-  } else {
-    const list = el('ol', 'groups-list');
-    state.customGroups.forEach((group, index) => list.append(renderGroupEditor(group, index)));
-    card.append(list);
-  }
-
+  card.append(head, intro, panel.empty, panel.list);
+  panel.shell = card;
+  panel.editors.clear();
   els.groupsPanel.replaceChildren(card);
-  restoreDraft(draft);
 }
 
-function renderGroupEditor(group, index) {
+function createGroupEditor(id) {
+  const save = (patch) => changeGroups(() => editGroup(id, patch));
   const item = el('li', 'group-editor');
-  item.dataset.customGroupId = group.id;
-  item.dataset.color = group.color;
+  item.dataset.customGroupId = id;
 
   const head = el('div', 'group-editor-head');
   const dot = el('span', 'group-dot');
@@ -1869,10 +1911,9 @@ function renderGroupEditor(group, index) {
   const label = document.createElement('input');
   label.type = 'text';
   label.className = 'group-edit-label';
-  label.value = group.label;
   label.maxLength = 80;
   label.setAttribute('aria-label', 'Group name');
-  label.addEventListener('change', () => changeGroups(() => editGroup(group.id, { label: label.value })));
+  label.addEventListener('change', () => save({ label: label.value }));
   label.addEventListener('keydown', (event) => {
     if (event.key === 'Enter') label.blur();
   });
@@ -1880,72 +1921,95 @@ function renderGroupEditor(group, index) {
   const colors = el('div', 'group-edit-color');
   colors.setAttribute('role', 'group');
   colors.setAttribute('aria-label', 'Color');
-  for (const color of GROUP_COLORS) {
+  const swatches = [...GROUP_COLORS].map((color) => {
     const swatch = document.createElement('button');
     swatch.type = 'button';
     swatch.className = 'color-swatch';
     swatch.dataset.color = color;
     swatch.title = color;
     swatch.setAttribute('aria-label', color);
-    swatch.setAttribute('aria-pressed', String(color === group.color));
-    swatch.addEventListener('click', () => changeGroups(() => editGroup(group.id, { color })));
-    colors.append(swatch);
-  }
+    swatch.addEventListener('click', () => save({ color }));
+    return swatch;
+  });
+  colors.append(...swatches);
 
   const actions = el('div', 'group-editor-actions');
-  if (state.confirmDeleteGroupId === group.id) {
-    const question = el('span', 'group-delete-question');
-    question.textContent = `Delete ${group.label}?`;
-    actions.append(
-      question,
-      createButton('Delete', () => {
-        state.confirmDeleteGroupId = null;
-        changeGroups(() => deleteGroup(group.id)).then(() => focusFirst(['#groups-add']));
-      }, 'is-danger group-delete-confirm'),
-      createButton('Cancel', cancelGroupDelete, 'group-delete-cancel'),
-    );
-  } else {
-    const up = createButton('↑', () => moveCustomGroup(group.id, -1), 'icon-button group-move-up');
-    up.disabled ||= index === 0;
-    up.setAttribute('aria-label', `Move ${group.label} up`);
-    const down = createButton('↓', () => moveCustomGroup(group.id, 1), 'icon-button group-move-down');
-    down.disabled ||= index === state.customGroups.length - 1;
-    down.setAttribute('aria-label', `Move ${group.label} down`);
-    const remove = createButton('Delete', () => {
-      state.confirmDeleteGroupId = group.id;
-      render();
-      document.querySelector(`[data-custom-group-id="${CSS.escape(group.id)}"] .group-delete-cancel`)?.focus();
-    }, 'group-delete');
-    actions.append(up, down, remove);
-  }
+  const up = createButton('↑', () => moveCustomGroup(id, -1), 'icon-button group-move-up');
+  const down = createButton('↓', () => moveCustomGroup(id, 1), 'icon-button group-move-down');
+  const remove = createButton('Delete', () => {
+    state.confirmDeleteGroupId = id;
+    render();
+    item.querySelector('.group-delete-cancel').focus();
+  }, 'group-delete');
+  actions.append(up, down, remove);
 
-  head.append(dot, label, colors, actions);
-
-  const fields = el('div', 'group-editor-fields');
-  fields.append(
-    listField('Domains', 'group-edit-domains', group.domains, 'example.com\ngithub.com/your-org',
-      (domains) => editGroup(group.id, { domains })),
-    listField('Keywords', 'group-edit-keywords', group.keywords, 'invoice\nquarterly report',
-      (keywords) => editGroup(group.id, { keywords })),
+  const confirm = el('div', 'group-editor-actions group-delete-prompt');
+  const question = el('span', 'group-delete-question');
+  confirm.append(
+    question,
+    createButton('Delete', () => {
+      state.confirmDeleteGroupId = null;
+      changeGroups(() => deleteGroup(id)).then(() => focusFirst(['#groups-add']));
+    }, 'is-danger group-delete-confirm'),
+    createButton('Cancel', cancelGroupDelete, 'group-delete-cancel'),
   );
 
+  head.append(dot, label, colors, actions, confirm);
+
+  const domains = listField('Domains', 'group-edit-domains', 'example.com\ngithub.com/your-org',
+    (lines) => save({ domains: lines }));
+  const keywords = listField('Keywords', 'group-edit-keywords', 'invoice\nquarterly report',
+    (lines) => save({ keywords: lines }));
+  const fields = el('div', 'group-editor-fields');
+  fields.append(domains.wrap, keywords.wrap);
+
   item.append(head, fields);
-  return item;
+  return {
+    item, label, swatches, up, down, remove, actions, confirm, question,
+    domains: domains.area, keywords: keywords.area,
+  };
 }
 
-function listField(title, className, values, placeholder, save) {
+// A focused field keeps what is being typed; it saves when it loses focus.
+function setFieldValue(field, value) {
+  if (field !== document.activeElement && field.value !== value) field.value = value;
+}
+
+function updateGroupEditor(editor, group, index, busy) {
+  editor.item.dataset.color = group.color;
+  setFieldValue(editor.label, group.label);
+  setFieldValue(editor.domains, group.domains.join('\n'));
+  setFieldValue(editor.keywords, group.keywords.join('\n'));
+  editor.domains.rows = Math.min(8, Math.max(3, group.domains.length + 1));
+  editor.keywords.rows = Math.min(8, Math.max(3, group.keywords.length + 1));
+  for (const swatch of editor.swatches) {
+    swatch.setAttribute('aria-pressed', String(swatch.dataset.color === group.color));
+    swatch.disabled = busy;
+  }
+  editor.up.disabled = busy || index === 0;
+  editor.down.disabled = busy || index === state.customGroups.length - 1;
+  editor.remove.disabled = busy;
+  editor.up.setAttribute('aria-label', `Move ${group.label} up`);
+  editor.down.setAttribute('aria-label', `Move ${group.label} down`);
+
+  const confirming = state.confirmDeleteGroupId === group.id;
+  editor.actions.hidden = confirming;
+  editor.confirm.hidden = !confirming;
+  editor.question.textContent = `Delete ${group.label}?`;
+  for (const button of editor.confirm.querySelectorAll('button')) button.disabled = busy;
+}
+
+function listField(title, className, placeholder, save) {
   const wrap = el('label', 'group-field');
   const name = el('span', 'group-field-name');
   name.textContent = `${title} · one per line`;
   const area = document.createElement('textarea');
   area.className = className;
-  area.rows = Math.min(8, Math.max(3, values.length + 1));
   area.spellcheck = false;
   area.placeholder = placeholder;
-  area.value = values.join('\n');
-  area.addEventListener('change', () => changeGroups(() => save(area.value.split('\n'))));
+  area.addEventListener('change', () => save(area.value.split('\n')));
   wrap.append(name, area);
-  return wrap;
+  return { wrap, area };
 }
 
 async function addGroupFromPanel() {
@@ -1974,30 +2038,6 @@ function cancelGroupDelete() {
   state.confirmDeleteGroupId = null;
   render();
   focusFirst([`[data-custom-group-id="${CSS.escape(id)}"] .group-delete`, '#groups-add']);
-}
-
-// The panel is rebuilt on every render; the field being typed in keeps its
-// unsaved text and caret, since it only saves when it loses focus.
-function captureDraft() {
-  const active = document.activeElement;
-  if (!(active instanceof HTMLInputElement || active instanceof HTMLTextAreaElement)) return null;
-  const editor = active.closest('[data-custom-group-id]');
-  if (!editor || !els.groupsPanel.contains(editor)) return null;
-  return {
-    selector: `[data-custom-group-id="${CSS.escape(editor.dataset.customGroupId)}"] .${active.classList[0]}`,
-    value: active.value,
-    start: active.selectionStart,
-    end: active.selectionEnd,
-  };
-}
-
-function restoreDraft(draft) {
-  if (!draft) return;
-  const field = els.groupsPanel.querySelector(draft.selector);
-  if (!field) return;
-  field.value = draft.value;
-  field.focus({ preventScroll: true });
-  field.setSelectionRange(draft.start, draft.end);
 }
 
 function toggleGroup(ctx, groupId) {

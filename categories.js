@@ -533,14 +533,21 @@ function countMatches(text, pattern) {
   return (text.match(pattern) || []).length;
 }
 
+/** The most specific custom domain rule for an address: { category, entry } or null. */
+export function matchCustomDomain(url, custom = NO_CUSTOM_GROUPS) {
+  const hostname = hostnameOf(url);
+  const path = pathOf(url);
+  const rule = custom.domainRules.find((r) => domainMatches(hostname, r.host) && pathHasPrefix(path, r.path));
+  return rule ? { category: rule.category, entry: rule.host + rule.path } : null;
+}
+
 export function categorizeTab(tab, custom = NO_CUSTOM_GROUPS) {
   const hostname = hostnameOf(tab.url);
   const title = (tab.title || '').toLowerCase();
   const path = pathOf(tab.url);
 
-  for (const rule of custom.domainRules) {
-    if (domainMatches(hostname, rule.host) && pathHasPrefix(path, rule.path)) return rule.category;
-  }
+  const domainRule = matchCustomDomain(tab.url, custom);
+  if (domainRule) return domainRule.category;
   for (const rule of custom.keywordRules) {
     if (countMatches(title, rule.pattern) > 0 || countMatches(path, rule.pattern) > 0) return rule.category;
   }
