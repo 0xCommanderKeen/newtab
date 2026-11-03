@@ -67,14 +67,43 @@ const ICONS = {
     'fill="currentColor"/></svg>',
 };
 
+const SOURCES = {
+  open: {
+    collapsedKey: COLLAPSED_KEY,
+    tabNoun: 'tab',
+    containerNoun: ['window', 'windows'],
+    windows: () => state.windows,
+    containerCount: () => state.windows.length,
+    error: () => state.openError,
+    errorTitle: 'Couldn’t read your tabs',
+    renderWindows: renderWindowView,
+    ageOf: openedAge,
+    empty: {
+      icon: ICONS.grid,
+      title: 'No other tabs open',
+      message: 'This is the only tab in your browser right now. Open a page and it will show up here.',
+    },
+    actions: {
+      activate: activateTab,
+      activateLabel: 'Switch to',
+      dismiss: closeTab,
+      dismissLabel: 'Close',
+      middleClick: closeTab,
+    },
+  },
+};
+
 const state = {
   windows: [],
-  groups: new Map(),
   openedAt: new Map(),
+  openError: null,
   query: '',
-  view: loadView(),
-  collapsed: loadCollapsed(),
-  collapsedCategories: loadCollapsedCategories(),
+  source: 'open',
+  view: loadChoice(VIEW_KEY, VIEWS, 'windows'),
+  collapsed: {
+    open: loadSet(COLLAPSED_KEY, toNumberId),
+  },
+  collapsedCategories: loadSet(COLLAPSED_CATEGORIES_KEY, toStringId),
   loading: true,
 };
 
@@ -88,7 +117,7 @@ function init() {
   els.overview = document.getElementById('overview');
   els.summary = document.getElementById('summary');
   els.search = document.getElementById('search');
-  els.viewButtons = document.querySelectorAll('.view-button');
+  els.viewButtons = document.querySelectorAll('.view-button[data-view]');
 
   if (!globalThis.chrome?.tabs?.query || !globalThis.chrome?.windows?.getAll) {
     renderUnsupported();
@@ -119,37 +148,49 @@ async function requestTimeSync() {
   }
 }
 
-async function refresh() {
+const LOADERS = { open: loadOpen };
+const pendingParts = new Set();
+
+async function refresh(parts = Object.keys(LOADERS)) {
+  await Promise.all(parts.map((part) => LOADERS[part]()));
+  state.loading = false;
+  render();
+}
+
+function scheduleRefresh(part) {
+  pendingParts.add(part);
+  clearTimeout(refreshTimer);
+  refreshTimer = setTimeout(() => {
+    const parts = [...pendingParts];
+    pendingParts.clear();
+    refresh(parts);
+  }, 80);
+}
+
+async function loadOpen() {
   try {
-    await loadData();
-    state.loading = false;
-    render();
+    const [windows, openedAt] = await Promise.all([readOpenWindows(), loadTabTimes()]);
+    state.windows = windows;
+    state.openedAt = openedAt;
+    state.openError = null;
+    pruneCollapsed('open', windows);
   } catch (error) {
     console.error('Tab Overview: failed to read tabs', error);
-    state.loading = false;
-    renderError(error);
+    state.openError = error;
   }
 }
 
-function scheduleRefresh() {
-  clearTimeout(refreshTimer);
-  refreshTimer = setTimeout(refresh, 80);
-}
-
-async function loadData() {
-  const [windows, groups, selfTab, openedAt] = await Promise.all([
+async function readOpenWindows() {
+  const [windows, groups, selfTab] = await Promise.all([
     chrome.windows.getAll({ populate: true }),
     chrome.tabGroups?.query ? chrome.tabGroups.query({}) : Promise.resolve([]),
     chrome.tabs.getCurrent ? chrome.tabs.getCurrent().catch(() => null) : Promise.resolve(null),
-    loadTabTimes(),
   ]);
 
   const selfTabId = selfTab?.id ?? null;
+  const groupsById = new Map(groups.map((group) => [group.id, group]));
 
-  state.groups = new Map(groups.map((group) => [group.id, group]));
-  state.openedAt = openedAt;
-
-  state.windows = windows
+  return windows
     .map((win) => ({
       ...win,
       tabs: (win.tabs || [])
@@ -157,17 +198,57 @@ async function loadData() {
         .sort((a, b) => a.index - b.index),
     }))
     .filter((win) => win.tabs.length > 0)
-    .sort((a, b) => Number(b.focused) - Number(a.focused) || a.id - b.id);
+    .sort((a, b) => Number(b.focused) - Number(a.focused) || a.id - b.id)
+    .map((win, index) => {
+      const title = win.focused ? 'Current window' : `Window ${index + 1}`;
+      return {
+        id: win.id,
+        title,
+        focused: win.focused,
+        incognito: win.incognito,
+        badge: { text: `W${index + 1}`, title },
+        tabs: win.tabs,
+        ...groupTabs(win.tabs, groupsById),
+      };
+    });
+}
 
-  // Drop remembered collapse state for groups that no longer exist.
-  let pruned = false;
-  for (const id of [...state.collapsed]) {
-    if (!state.groups.has(id)) {
-      state.collapsed.delete(id);
-      pruned = true;
+function groupTabs(tabs, groupsById) {
+  const byGroup = new Map();
+  const ungrouped = [];
+
+  for (const tab of tabs) {
+    if (tab.groupId === -1 || tab.groupId === undefined) {
+      ungrouped.push(tab);
+    } else {
+      if (!byGroup.has(tab.groupId)) byGroup.set(tab.groupId, []);
+      byGroup.get(tab.groupId).push(tab);
     }
   }
-  if (pruned) saveCollapsed();
+
+  const groups = [...byGroup.entries()]
+    .map(([id, groupTabs]) => {
+      const meta = groupsById.get(id);
+      return {
+        id,
+        title: meta?.title || '',
+        color: meta?.color || 'grey',
+        tabs: groupTabs,
+        firstIndex: Math.min(...groupTabs.map((tab) => tab.index)),
+      };
+    })
+    .sort((a, b) => a.firstIndex - b.firstIndex);
+
+  return { groups, ungrouped };
+}
+
+function pruneCollapsed(source, windows) {
+  const live = new Set(windows.flatMap((win) => win.groups.map((group) => group.id)));
+  const collapsed = state.collapsed[source];
+  const stale = [...collapsed].filter((id) => !live.has(id));
+  if (stale.length === 0) return;
+  for (const id of stale) collapsed.delete(id);
+  saveSet(SOURCES[source].collapsedKey, collapsed);
 }
 
 async function loadTabTimes() {
@@ -197,7 +278,7 @@ async function loadTabTimes() {
 /* ------------------------------------------------------------------ events */
 
 function bindEvents() {
-  const reload = () => scheduleRefresh();
+  const reload = () => scheduleRefresh('open');
 
   for (const name of ['onCreated', 'onRemoved', 'onMoved', 'onAttached', 'onDetached', 'onActivated']) {
     chrome.tabs[name]?.addListener(reload);
@@ -282,7 +363,7 @@ function bindViewSwitch() {
       const view = button.dataset.view;
       if (!VIEWS.has(view) || view === state.view) return;
       state.view = view;
-      saveView();
+      saveValue(VIEW_KEY, view);
       applyViewButtons();
       render();
     });
@@ -302,10 +383,8 @@ function applyViewButtons() {
 function render() {
   if (!els.overview) return;
 
-  const focusedTabId = document.activeElement?.closest?.('.tab')?.dataset.tabId || null;
-  const focusedGroupId = document.activeElement?.closest?.('.group-header')?.dataset.groupId || null;
-  const focusedCategoryId = document.activeElement?.closest?.('.category-header')?.dataset.categoryId || null;
-  const query = state.query.trim().toLowerCase();
+  const focus = focusKey();
+  const ctx = sourceContext(state.source);
 
   if (state.loading) {
     els.summary.textContent = 'Reading your tabs…';
@@ -313,34 +392,64 @@ function render() {
     return;
   }
 
-  const totalTabs = state.windows.reduce((sum, win) => sum + win.tabs.length, 0);
   els.overview.replaceChildren();
+  renderSource(ctx);
+  restoreFocus(focus);
+}
 
-  if (state.windows.length === 0) {
-    els.overview.append(createEmptyState({
-      icon: ICONS.grid,
-      title: 'No other tabs open',
-      message: 'This is the only tab in your browser right now. Open a page and it will show up here.',
-    }));
-    els.summary.textContent = '0 tabs';
+function sourceContext(source) {
+  return {
+    ...SOURCES[source],
+    source,
+    query: state.query.trim().toLowerCase(),
+    collapsed: state.collapsed[source],
+  };
+}
+
+function renderSource(ctx) {
+  const error = ctx.error();
+  if (error) {
+    renderError(error, ctx.errorTitle);
     return;
   }
 
-  if (state.view === 'sorted') {
-    renderSortedView(query, totalTabs);
-  } else {
-    renderWindowView(query, totalTabs);
+  const windows = ctx.windows();
+  const totalTabs = windows.reduce((sum, win) => sum + win.tabs.length, 0);
+
+  if (totalTabs === 0) {
+    els.overview.append(createEmptyState(ctx.empty));
+    els.summary.textContent = plural(0, ctx.tabNoun);
+    return;
   }
 
-  restoreFocus(focusedTabId, focusedGroupId, focusedCategoryId);
+  const { matched, detail } = state.view === 'sorted'
+    ? renderSortedView(windows, ctx)
+    : ctx.renderWindows(ctx);
+
+  if (matched === 0) {
+    renderEmptySearch(totalTabs, ctx);
+    return;
+  }
+
+  const [one, many] = ctx.containerNoun;
+  els.summary.textContent = ctx.query
+    ? matchSummary(matched, totalTabs, ctx.tabNoun)
+    : `${plural(totalTabs, ctx.tabNoun)} · ${detail} · ${plural(ctx.containerCount(), one, many)}`;
 }
 
-function renderWindowView(query, totalTabs) {
-  const totalGroups = countGroups(state.windows);
+function renderWindowView(ctx) {
+  const { sections, matched } = filterWindows(state.windows, ctx.query);
+  for (const section of sections) {
+    els.overview.append(renderWindow(section, ctx));
+  }
+  return { matched, detail: plural(countGroups(state.windows), 'group') };
+}
+
+function filterWindows(windows, query) {
   const sections = [];
   let matched = 0;
 
-  for (const win of state.windows) {
+  for (const win of windows) {
     const filtered = filterWindow(win, query);
     const count = countVisible(filtered);
     if (count === 0) continue;
@@ -348,77 +457,67 @@ function renderWindowView(query, totalTabs) {
     sections.push({ win, ...filtered, count });
   }
 
-  if (sections.length === 0) {
-    renderEmptySearch(totalTabs);
-    return;
-  }
-
-  for (const section of sections) {
-    els.overview.append(renderWindow(section));
-  }
-
-  els.summary.textContent = query
-    ? matchSummary(matched, totalTabs)
-    : `${plural(totalTabs, 'tab')} · ${plural(totalGroups, 'group')} · ${plural(state.windows.length, 'window')}`;
+  return { sections, matched };
 }
 
-function renderSortedView(query, totalTabs) {
-  const categories = buildCategories(query);
-
-  if (categories.length === 0) {
-    renderEmptySearch(totalTabs);
-    return;
-  }
-
-  const matched = categories.reduce((sum, bucket) => sum + bucket.tabs.length, 0);
-
+function renderSortedView(windows, ctx) {
+  const categories = buildCategories(windows, ctx.query);
   for (const bucket of categories) {
-    els.overview.append(renderCategory(bucket, query));
+    els.overview.append(renderCategory(bucket, ctx));
   }
-
-  els.summary.textContent = query
-    ? matchSummary(matched, totalTabs)
-    : `${plural(totalTabs, 'tab')} · ${plural(categories.length, 'category', 'categories')} · ${plural(state.windows.length, 'window')}`;
+  return {
+    matched: categories.reduce((sum, bucket) => sum + bucket.tabs.length, 0),
+    detail: plural(categories.length, 'category', 'categories'),
+  };
 }
 
-function renderEmptySearch(totalTabs) {
+function renderEmptySearch(totalTabs, ctx) {
   els.overview.append(createEmptyState({
     icon: ICONS.search,
-    title: `No tabs match “${state.query.trim()}”`,
+    title: `No ${ctx.tabNoun}s match “${state.query.trim()}”`,
     message: 'Try a shorter search, or search by site address.',
     actionLabel: 'Clear search',
     onAction: clearSearch,
   }));
-  els.summary.textContent = matchSummary(0, totalTabs);
+  els.summary.textContent = matchSummary(0, totalTabs, ctx.tabNoun);
 }
 
-function restoreFocus(focusedTabId, focusedGroupId, focusedCategoryId) {
-  if (focusedTabId) {
-    els.overview
-      .querySelector(`.tab[data-tab-id="${focusedTabId}"]`)
-      ?.focus({ preventScroll: true });
-  } else if (focusedGroupId) {
-    els.overview
-      .querySelector(`.group-header[data-group-id="${focusedGroupId}"]`)
-      ?.focus({ preventScroll: true });
-  } else if (focusedCategoryId) {
-    els.overview
-      .querySelector(`.category-header[data-category-id="${focusedCategoryId}"]`)
-      ?.focus({ preventScroll: true });
+const FOCUS_SCOPES = ['data-tab-id', 'data-group-id', 'data-category-id', 'data-batch-id'];
+
+// Every render rebuilds the overview, so focus is remembered as a selector and
+// put back on the equivalent new element.
+function focusKey() {
+  const active = document.activeElement;
+  if (!(active instanceof HTMLElement) || active === document.body) return null;
+  if (active.id) return `#${CSS.escape(active.id)}`;
+
+  for (const attr of FOCUS_SCOPES) {
+    const scope = active.closest(`[${attr}]`);
+    if (!scope) continue;
+    const base = `[${attr}="${CSS.escape(scope.getAttribute(attr))}"]`;
+    if (scope === active) return base;
+    return active.classList[0] ? `${base} .${CSS.escape(active.classList[0])}` : null;
   }
+  return null;
 }
 
-function buildCategories(query) {
+function restoreFocus(key) {
+  if (!key) return;
+  const target = document.querySelector(key);
+  if (target && target !== document.activeElement) target.focus({ preventScroll: true });
+}
+
+function buildCategories(windows, query) {
   const buckets = new Map();
 
-  for (const win of state.windows) {
-    const windowIndex = state.windows.indexOf(win) + 1;
+  for (const win of windows) {
+    const groupTitles = new Map(win.groups.map((group) => [group.id, group.title]));
 
     for (const tab of win.tabs) {
       const category = categorizeTab(tab);
       const categoryMatches = category.label.toLowerCase().includes(query);
 
-      if (query && !categoryMatches && !tabMatchesQuery(tab, query)) continue;
+      if (query && !categoryMatches && !tabMatchesQuery(tab, groupTitles.get(tab.groupId), query)) continue;
 
       if (!buckets.has(category.id)) {
         buckets.set(category.id, {
@@ -429,7 +528,7 @@ function buildCategories(query) {
       }
 
       const bucket = buckets.get(category.id);
-      bucket.tabs.push({ tab, win, windowIndex });
+      bucket.tabs.push({ tab, win });
       bucket.windows.add(win.id);
     }
   }
@@ -439,18 +538,17 @@ function buildCategories(query) {
   );
 }
 
-function tabMatchesQuery(tab, query) {
-  const group = state.groups.get(tab.groupId);
+function tabMatchesQuery(tab, groupTitle, query) {
   return (tab.title || '').toLowerCase().includes(query) ||
     (tab.url || '').toLowerCase().includes(query) ||
-    (group?.title || '').toLowerCase().includes(query);
+    (groupTitle || '').toLowerCase().includes(query);
 }
 
-function renderCategory({ meta, tabs }, query) {
+function renderCategory({ meta, tabs }, ctx) {
   const section = el('section', 'category');
   section.dataset.category = meta.id;
 
-  const isCollapsed = query === '' && state.collapsedCategories.has(meta.id);
+  const isCollapsed = ctx.query === '' && state.collapsedCategories.has(meta.id);
   if (isCollapsed) section.classList.add('is-collapsed');
 
   const header = document.createElement('button');
@@ -475,13 +573,8 @@ function renderCategory({ meta, tabs }, query) {
 
   if (!isCollapsed) {
     const grid = el('div', 'group-tabs');
-    for (const { tab, win, windowIndex } of tabs) {
-      grid.append(renderTab(tab, {
-        windowBadge: {
-          text: `W${windowIndex}`,
-          title: win.focused ? 'Current window' : `Window ${windowIndex}`,
-        },
-      }));
+    for (const { tab, win } of tabs) {
+      grid.append(renderTab(tab, ctx, { windowBadge: win.badge }));
     }
     section.append(grid);
   }
@@ -495,56 +588,26 @@ function toggleCategory(categoryId) {
   } else {
     state.collapsedCategories.add(categoryId);
   }
-  saveCollapsedCategories();
+  saveSet(COLLAPSED_CATEGORIES_KEY, state.collapsedCategories);
   render();
 }
 
 function filterWindow(win, query) {
-  const { groups, ungrouped } = groupTabsForWindow(win);
+  const { groups, ungrouped } = win;
   if (!query) return { groups, ungrouped };
-
-  const matches = (tab, groupTitle) =>
-    (tab.title || '').toLowerCase().includes(query) ||
-    (tab.url || '').toLowerCase().includes(query) ||
-    (groupTitle || '').toLowerCase().includes(query);
 
   return {
     groups: groups
       .map((group) => ({
         ...group,
-        tabs: group.tabs.filter((tab) => matches(tab, group.meta.title)),
+        tabs: group.tabs.filter((tab) => tabMatchesQuery(tab, group.title, query)),
       }))
       .filter((group) => group.tabs.length > 0),
-    ungrouped: ungrouped.filter((tab) => matches(tab, '')),
+    ungrouped: ungrouped.filter((tab) => tabMatchesQuery(tab, '', query)),
   };
 }
 
-function groupTabsForWindow(win) {
-  const byGroup = new Map();
-  const ungrouped = [];
-
-  for (const tab of win.tabs) {
-    if (tab.groupId === -1 || tab.groupId === undefined) {
-      ungrouped.push(tab);
-    } else {
-      if (!byGroup.has(tab.groupId)) byGroup.set(tab.groupId, []);
-      byGroup.get(tab.groupId).push(tab);
-    }
-  }
-
-  const groups = [...byGroup.entries()]
-    .map(([id, tabs]) => ({
-      id,
-      meta: state.groups.get(id) || { id, title: '', color: 'grey' },
-      tabs,
-      firstIndex: Math.min(...tabs.map((tab) => tab.index)),
-    }))
-    .sort((a, b) => a.firstIndex - b.firstIndex);
-
-  return { groups, ungrouped };
-}
-
-function renderWindow({ win, groups, ungrouped, count }) {
+function renderWindow({ win, groups, ungrouped, count }, ctx) {
   const section = el('section', 'window');
   if (win.focused) section.classList.add('is-focused');
 
@@ -553,9 +616,7 @@ function renderWindow({ win, groups, ungrouped, count }) {
   titleWrap.append(el('span', 'window-dot'));
 
   const heading = document.createElement('h2');
-  heading.textContent = win.focused
-    ? 'Current window'
-    : `Window ${state.windows.indexOf(win) + 1}`;
+  heading.textContent = win.title;
   titleWrap.append(heading);
 
   if (win.incognito) {
@@ -581,19 +642,19 @@ function renderWindow({ win, groups, ungrouped, count }) {
   section.append(head);
 
   const body = el('div', 'window-body');
-  for (const group of groups) body.append(renderGroup(group));
-  if (ungrouped.length > 0) body.append(renderUngrouped(ungrouped, groups.length > 0));
+  for (const group of groups) body.append(renderGroup(group, ctx));
+  if (ungrouped.length > 0) body.append(renderUngrouped(ungrouped, groups.length > 0, ctx));
   section.append(body);
 
   return section;
 }
 
-function renderGroup(group) {
+function renderGroup(group, ctx) {
   const section = el('section', 'group');
-  const color = VALID_COLORS.has(group.meta.color) ? group.meta.color : 'grey';
+  const color = VALID_COLORS.has(group.color) ? group.color : 'grey';
   section.dataset.color = color;
 
-  const isCollapsed = state.query.trim() === '' && state.collapsed.has(group.id);
+  const isCollapsed = ctx.query === '' && ctx.collapsed.has(group.id);
   if (isCollapsed) section.classList.add('is-collapsed');
 
   const header = document.createElement('button');
@@ -603,7 +664,7 @@ function renderGroup(group) {
   header.setAttribute('aria-expanded', String(!isCollapsed));
   header.setAttribute(
     'aria-label',
-    `${group.meta.title || 'Untitled group'}, ${plural(group.tabs.length, 'tab')}`,
+    `${group.title || 'Untitled group'}, ${plural(group.tabs.length, 'tab')}`,
   );
 
   const chevron = el('span', 'group-chevron');
@@ -611,24 +672,24 @@ function renderGroup(group) {
 
   const dot = el('span', 'group-dot');
   const name = el('span', 'group-name');
-  name.textContent = group.meta.title || 'Untitled group';
+  name.textContent = group.title || 'Untitled group';
   const count = el('span', 'group-count');
   count.textContent = String(group.tabs.length);
 
   header.append(chevron, dot, name, count);
-  header.addEventListener('click', () => toggleGroup(group.id));
+  header.addEventListener('click', () => toggleGroup(ctx, group.id));
   section.append(header);
 
   if (!isCollapsed) {
     const tabs = el('div', 'group-tabs');
-    for (const tab of group.tabs) tabs.append(renderTab(tab));
+    for (const tab of group.tabs) tabs.append(renderTab(tab, ctx));
     section.append(tabs);
   }
 
   return section;
 }
 
-function renderUngrouped(tabs, showLabel) {
+function renderUngrouped(tabs, showLabel, ctx) {
   const section = el('section', 'group group-ungrouped');
   if (showLabel) section.classList.add('has-label');
 
@@ -643,15 +704,17 @@ function renderUngrouped(tabs, showLabel) {
   }
 
   const grid = el('div', 'group-tabs');
-  for (const tab of tabs) grid.append(renderTab(tab));
+  for (const tab of tabs) grid.append(renderTab(tab, ctx));
   section.append(grid);
 
   return section;
 }
 
-function renderTab(tab, options = {}) {
+function renderTab(tab, ctx, options = {}) {
+  const { actions } = ctx;
   const card = el('div', 'tab');
   card.dataset.tabId = String(tab.id);
+  if (tab.bookmarkId) card.dataset.bookmarkId = tab.bookmarkId;
 
   const titleText = tab.title?.trim() || displayUrl(tab.url) || 'Untitled tab';
   card.title = [tab.title?.trim(), tab.url].filter(Boolean).join('\n');
@@ -662,7 +725,7 @@ function renderTab(tab, options = {}) {
   const main = el('div', 'tab-main');
   main.tabIndex = 0;
   main.setAttribute('role', 'button');
-  main.setAttribute('aria-label', `Switch to ${titleText}`);
+  main.setAttribute('aria-label', `${actions.activateLabel} ${titleText}`);
 
   main.append(createFavicon(tab));
 
@@ -681,7 +744,7 @@ function renderTab(tab, options = {}) {
   if (flags.childElementCount > 0) titleRow.append(flags);
 
   const urlText = displayUrl(tab.url);
-  const opened = state.openedAt.get(tab.id);
+  const age = ctx.ageOf(tab);
 
   text.append(titleRow);
 
@@ -692,17 +755,17 @@ function renderTab(tab, options = {}) {
     meta.append(url);
   }
 
-  if (opened) {
-    const age = el('span', 'tab-age');
-    if (opened.approximate) {
-      age.textContent = 'Before tracking';
-      age.title = 'This tab was already open when Tab Overview started tracking.';
+  if (age) {
+    const ageEl = el('span', 'tab-age');
+    ageEl.title = age.title;
+    if (typeof age.since === 'number') {
+      ageEl.textContent = age.prefix + formatAge(age.since);
+      ageEl.dataset.since = String(age.since);
+      ageEl.dataset.prefix = age.prefix;
     } else {
-      age.textContent = formatAge(opened.openedAt);
-      age.title = `Opened ${new Date(opened.openedAt).toLocaleString()}`;
-      age.dataset.openedAt = String(opened.openedAt);
+      ageEl.textContent = age.text;
     }
-    meta.append(age);
+    meta.append(ageEl);
   }
 
   if (options.windowBadge) {
@@ -715,30 +778,49 @@ function renderTab(tab, options = {}) {
   if (meta.childElementCount > 0) text.append(meta);
 
   main.append(text);
-  main.addEventListener('click', () => activateTab(tab));
+  main.addEventListener('click', () => actions.activate(tab));
   main.addEventListener('keydown', (event) => {
     if (event.key === 'Enter' || event.key === ' ') {
       event.preventDefault();
-      activateTab(tab);
+      actions.activate(tab);
     }
   });
 
   const close = document.createElement('button');
   close.type = 'button';
   close.className = 'tab-close';
-  close.setAttribute('aria-label', `Close ${titleText}`);
+  close.title = actions.dismissLabel;
+  close.setAttribute('aria-label', `${actions.dismissLabel} ${titleText}`);
   close.append(createIcon(ICONS.close));
-  close.addEventListener('click', () => closeTab(tab));
+  close.addEventListener('click', () => actions.dismiss(tab));
 
   card.append(main, close);
-  card.addEventListener('auxclick', (event) => {
-    if (event.button === 1) {
-      event.preventDefault();
-      closeTab(tab);
-    }
-  });
+  if (actions.middleClick) {
+    card.addEventListener('auxclick', (event) => {
+      if (event.button === 1) {
+        event.preventDefault();
+        actions.middleClick(tab);
+      }
+    });
+  }
 
   return card;
+}
+
+function openedAge(tab) {
+  const opened = state.openedAt.get(tab.id);
+  if (!opened) return null;
+  if (opened.approximate) {
+    return {
+      text: 'Before tracking',
+      title: 'This tab was already open when Tab Overview started tracking.',
+    };
+  }
+  return {
+    since: opened.openedAt,
+    prefix: '',
+    title: `Opened ${new Date(opened.openedAt).toLocaleString()}`,
+  };
 }
 
 function createFavicon(tab) {
@@ -825,11 +907,11 @@ function renderUnsupported() {
   }));
 }
 
-function renderError(error) {
+function renderError(error, title) {
   els.summary.textContent = 'Something went wrong';
   els.overview.replaceChildren(createEmptyState({
     icon: ICONS.alert,
-    title: 'Couldn’t read your tabs',
+    title,
     message: error?.message || 'Chrome blocked access to the tabs API.',
     actionLabel: 'Try again',
     onAction: () => {
@@ -848,7 +930,7 @@ async function activateTab(tab) {
     await chrome.windows.update(tab.windowId, { focused: true });
   } catch (error) {
     console.warn('Tab Overview: could not switch to tab', error);
-    scheduleRefresh();
+    scheduleRefresh('open');
   }
 }
 
@@ -857,17 +939,17 @@ async function closeTab(tab) {
     await chrome.tabs.remove(tab.id);
   } catch (error) {
     console.warn('Tab Overview: could not close tab', error);
-    scheduleRefresh();
+    scheduleRefresh('open');
   }
 }
 
-function toggleGroup(groupId) {
-  if (state.collapsed.has(groupId)) {
-    state.collapsed.delete(groupId);
+function toggleGroup(ctx, groupId) {
+  if (ctx.collapsed.has(groupId)) {
+    ctx.collapsed.delete(groupId);
   } else {
-    state.collapsed.add(groupId);
+    ctx.collapsed.add(groupId);
   }
-  saveCollapsed();
+  saveSet(ctx.collapsedKey, ctx.collapsed);
   render();
 }
 
@@ -881,74 +963,50 @@ function isSelfTab(tab) {
     /^(?:chrome|brave|edge|opera|vivaldi):\/\/new-?tab/.test(url);
 }
 
-function loadCollapsed() {
+function loadSet(key, normalize) {
   try {
-    const raw = localStorage.getItem(COLLAPSED_KEY);
+    const raw = localStorage.getItem(key);
     const ids = raw ? JSON.parse(raw) : [];
     return new Set(
-      Array.isArray(ids) ? ids.map(Number).filter(Number.isFinite) : [],
+      Array.isArray(ids) ? ids.map(normalize).filter((id) => id !== null) : [],
     );
   } catch {
     return new Set();
   }
 }
 
-function saveCollapsed() {
+function saveSet(key, set) {
+  saveValue(key, JSON.stringify([...set]));
+}
+
+function toNumberId(value) {
+  const id = Number(value);
+  return Number.isFinite(id) ? id : null;
+}
+
+function toStringId(value) {
+  return typeof value === 'string' ? value : null;
+}
+
+function loadChoice(key, allowed, fallback) {
   try {
-    localStorage.setItem(COLLAPSED_KEY, JSON.stringify([...state.collapsed]));
+    const value = localStorage.getItem(key);
+    return allowed.has(value) ? value : fallback;
   } catch {
-    // Storage can be unavailable in private or restricted contexts.
+    return fallback;
   }
 }
 
-function loadCollapsedCategories() {
+function saveValue(key, value) {
   try {
-    const raw = localStorage.getItem(COLLAPSED_CATEGORIES_KEY);
-    const ids = raw ? JSON.parse(raw) : [];
-    return new Set(
-      Array.isArray(ids) ? ids.filter((id) => typeof id === 'string') : [],
-    );
-  } catch {
-    return new Set();
-  }
-}
-
-function saveCollapsedCategories() {
-  try {
-    localStorage.setItem(
-      COLLAPSED_CATEGORIES_KEY,
-      JSON.stringify([...state.collapsedCategories]),
-    );
-  } catch {
-    // Storage can be unavailable in private or restricted contexts.
-  }
-}
-
-function loadView() {
-  try {
-    const value = localStorage.getItem(VIEW_KEY);
-    return VIEWS.has(value) ? value : 'windows';
-  } catch {
-    return 'windows';
-  }
-}
-
-function saveView() {
-  try {
-    localStorage.setItem(VIEW_KEY, state.view);
+    localStorage.setItem(key, value);
   } catch {
     // Storage can be unavailable in private or restricted contexts.
   }
 }
 
 function countGroups(windows) {
-  const ids = new Set();
-  for (const win of windows) {
-    for (const tab of win.tabs) {
-      if (tab.groupId !== -1 && tab.groupId !== undefined) ids.add(tab.groupId);
-    }
-  }
-  return ids.size;
+  return windows.reduce((sum, win) => sum + win.groups.length, 0);
 }
 
 function countVisible({ groups, ungrouped }) {
@@ -981,14 +1039,14 @@ function formatAge(openedAt) {
 function updateAges() {
   if (document.visibilityState !== 'visible') return;
 
-  for (const node of document.querySelectorAll('.tab-age[data-opened-at]')) {
-    const openedAt = Number(node.dataset.openedAt);
-    if (Number.isFinite(openedAt)) node.textContent = formatAge(openedAt);
+  for (const node of document.querySelectorAll('.tab-age[data-since]')) {
+    const since = Number(node.dataset.since);
+    if (Number.isFinite(since)) node.textContent = (node.dataset.prefix || '') + formatAge(since);
   }
 }
 
-function matchSummary(matched, total) {
-  return `${matched} of ${plural(total, 'tab')} ${matched === 1 ? 'matches' : 'match'}`;
+function matchSummary(matched, total, noun) {
+  return `${matched} of ${plural(total, noun)} ${matched === 1 ? 'matches' : 'match'}`;
 }
 
 function displayUrl(url) {
