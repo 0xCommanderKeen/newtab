@@ -198,9 +198,9 @@ function init() {
   els.viewButtons = document.querySelectorAll('.view-button[data-view]');
   els.sourceSwitch = document.getElementById('source-switch');
   els.sourceButtons = document.querySelectorAll('.source-button');
+  els.openCount = document.getElementById('open-count');
   els.archiveCount = document.getElementById('archive-count');
   els.archiveAll = document.getElementById('archive-all');
-  els.archiveTools = document.getElementById('archive-tools');
   els.archiveExport = document.getElementById('archive-export');
   els.archiveImport = document.getElementById('archive-import');
   els.archiveImportFile = document.getElementById('archive-import-file');
@@ -596,7 +596,8 @@ function applyViewButtons() {
   for (const button of els.sourceButtons) {
     const active = button.dataset.source === state.source;
     button.classList.toggle('is-active', active);
-    button.setAttribute('aria-pressed', String(active));
+    button.setAttribute('aria-selected', String(active));
+    button.tabIndex = active ? 0 : -1;
   }
 }
 
@@ -607,6 +608,17 @@ function bindArchiveControls() {
   for (const button of els.sourceButtons) {
     button.addEventListener('click', () => switchSource(button.dataset.source));
   }
+  // Arrow keys move between the page tabs, as in any tab list.
+  els.sourceSwitch.addEventListener('keydown', (event) => {
+    const buttons = [...els.sourceButtons];
+    const current = buttons.findIndex((button) => button.dataset.source === state.source);
+    const index = { ArrowLeft: current - 1, ArrowRight: current + 1, Home: 0, End: buttons.length - 1 }[event.key];
+    if (index === undefined) return;
+    event.preventDefault();
+    const next = buttons[(index + buttons.length) % buttons.length];
+    switchSource(next.dataset.source);
+    next.focus();
+  });
   els.archiveAll.addEventListener('click', () => promptArchive(ALL_TABS, '#archive-all'));
   els.archiveExport.addEventListener('click', downloadArchive);
   els.archiveImport.addEventListener('click', () => els.archiveImportFile.click());
@@ -696,6 +708,7 @@ function renderControls() {
   const busy = isBusy();
   const archived = state.batches.reduce((sum, batch) => sum + batch.tabCount, 0);
   els.archiveCount.textContent = String(archived);
+  els.openCount.textContent = String(state.windows.reduce((sum, win) => sum + win.tabs.length, 0));
 
   const count = planArchive(state.windows).count;
   els.archiveAll.hidden = state.source !== 'open';
@@ -704,7 +717,8 @@ function renderControls() {
     ? 'No tabs to archive'
     : `Save ${plural(count, 'tab')} to the archive and close them`;
 
-  els.archiveTools.hidden = state.source !== 'archive';
+  els.archiveExport.hidden = state.source !== 'archive';
+  els.archiveImport.hidden = state.source !== 'archive';
   els.archiveExport.disabled = busy || (archived === 0 && state.customGroups.length === 0);
   els.archiveImport.disabled = busy;
 
