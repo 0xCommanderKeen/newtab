@@ -1,6 +1,19 @@
 'use strict';
 
 import { CATEGORY_INDEX, categorizeTab } from './categories.js';
+import {
+  GROUP_COLORS,
+  archivePlan,
+  deleteBatch,
+  exportArchive,
+  importArchive,
+  isBatchKey,
+  loadArchive,
+  planArchive,
+  removeArchivedTabs,
+  reopenArchivedTab,
+  restoreBatch,
+} from './archive.js';
 
 const SELF_URL = globalThis.chrome?.runtime?.getURL
   ? chrome.runtime.getURL('newtab.html')
@@ -11,12 +24,14 @@ const EXTENSION_ORIGIN = globalThis.chrome?.runtime?.getURL
 
 const COLLAPSED_KEY = 'tabOverview.collapsedGroups';
 const COLLAPSED_CATEGORIES_KEY = 'tabOverview.collapsedCategories';
+const ARCHIVE_COLLAPSED_KEY = 'tabOverview.collapsedArchiveGroups';
 const VIEW_KEY = 'tabOverview.view';
+const SOURCE_KEY = 'tabOverview.source';
 const OPENED_AT_PREFIX = 'tabOpenedAt:';
 const VIEWS = new Set(['windows', 'sorted']);
-const VALID_COLORS = new Set([
-  'grey', 'blue', 'red', 'yellow', 'green', 'pink', 'purple', 'cyan', 'orange',
-]);
+const ARCHIVE_AVAILABLE = Boolean(globalThis.chrome?.storage?.local?.get);
+const SOURCE_NAMES = new Set(ARCHIVE_AVAILABLE ? ['open', 'archive'] : ['open']);
+const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
 
 const ICONS = {
   chevron:
@@ -65,21 +80,89 @@ const ICONS = {
     'stroke-linejoin="round"/><path d="M12 9v5" stroke="currentColor" ' +
     'stroke-width="1.8" stroke-linecap="round"/><circle cx="12" cy="17" r="1" ' +
     'fill="currentColor"/></svg>',
+  archive:
+    '<svg viewBox="0 0 24 24" fill="none" aria-hidden="true">' +
+    '<rect x="3" y="4" width="18" height="5" rx="1.5" stroke="currentColor" ' +
+    'stroke-width="1.6"/><path d="M5 9v9a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V9M10 13h4" ' +
+    'stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>',
+};
+
+const SOURCES = {
+  open: {
+    collapsedKey: COLLAPSED_KEY,
+    tabNoun: 'tab',
+    containerNoun: ['window', 'windows'],
+    windows: () => state.windows,
+    containerCount: () => state.windows.length,
+    error: () => state.openError,
+    errorTitle: 'Couldn’t read your tabs',
+    renderWindows: renderWindowView,
+    ageOf: openedAge,
+    empty: {
+      icon: ICONS.grid,
+      title: 'No other tabs open',
+      message: 'This is the only tab in your browser right now. Open a page and it will show up here.',
+    },
+    actions: {
+      activate: activateTab,
+      activateLabel: 'Switch to',
+      dismiss: closeTab,
+      dismissLabel: 'Close',
+      middleClick: closeTab,
+    },
+  },
+  archive: {
+    collapsedKey: ARCHIVE_COLLAPSED_KEY,
+    tabNoun: 'archived tab',
+    containerNoun: ['batch', 'batches'],
+    windows: () => state.batches.flatMap((batch) => batch.windows),
+    containerCount: () => state.batches.length,
+    error: () => state.archiveError,
+    errorTitle: 'Couldn’t read the archive',
+    renderWindows: renderBatchesView,
+    ageOf: archivedAge,
+    empty: {
+      icon: ICONS.archive,
+      title: 'Your archive is empty',
+      message: 'Archive all, on the Open view, saves every open tab here and closes it. ' +
+        'Archived tabs keep their windows and groups, and you can search and reopen them ' +
+        'any time. Import brings back a backup file you exported earlier.',
+      actionLabel: 'Show open tabs',
+      onAction: () => switchSource('open'),
+    },
+    actions: {
+      activate: openArchivedTab,
+      activateLabel: 'Open',
+      dismiss: deleteArchivedTab,
+      dismissLabel: 'Remove from archive',
+    },
+  },
 };
 
 const state = {
   windows: [],
-  groups: new Map(),
   openedAt: new Map(),
+  openError: null,
+  batches: [],
+  archiveError: null,
   query: '',
-  view: loadView(),
-  collapsed: loadCollapsed(),
-  collapsedCategories: loadCollapsedCategories(),
+  source: loadChoice(SOURCE_KEY, SOURCE_NAMES, 'open'),
+  view: loadChoice(VIEW_KEY, VIEWS, 'windows'),
+  collapsed: {
+    open: loadSet(COLLAPSED_KEY, toNumberId),
+    archive: loadSet(ARCHIVE_COLLAPSED_KEY, toStringId),
+  },
+  collapsedCategories: loadSet(COLLAPSED_CATEGORIES_KEY, toStringId),
+  // null | { kind: 'confirm' } | { kind: 'busy', text }
+  //      | { kind: 'result', text, detail, tone }
+  prompt: null,
+  confirmDeleteBatchId: null,
   loading: true,
 };
 
 const els = {};
 const iconTemplates = new Map();
+const pendingArchivedTabs = new Set();
 let refreshTimer = null;
 
 /* ------------------------------------------------------------------ startup */
@@ -88,7 +171,17 @@ function init() {
   els.overview = document.getElementById('overview');
   els.summary = document.getElementById('summary');
   els.search = document.getElementById('search');
-  els.viewButtons = document.querySelectorAll('.view-button');
+  els.viewButtons = document.querySelectorAll('.view-button[data-view]');
+  els.sourceSwitch = document.getElementById('source-switch');
+  els.sourceButtons = document.querySelectorAll('.source-button');
+  els.archiveCount = document.getElementById('archive-count');
+  els.archiveAll = document.getElementById('archive-all');
+  els.archiveTools = document.getElementById('archive-tools');
+  els.archiveExport = document.getElementById('archive-export');
+  els.archiveImport = document.getElementById('archive-import');
+  els.archiveImportFile = document.getElementById('archive-import-file');
+  els.banner = document.getElementById('banner');
+  els.footerHint = document.getElementById('footer-hint');
 
   if (!globalThis.chrome?.tabs?.query || !globalThis.chrome?.windows?.getAll) {
     renderUnsupported();
@@ -96,8 +189,10 @@ function init() {
   }
 
   bindEvents();
+  bindPointerHold();
   bindSearch();
   bindViewSwitch();
+  bindArchiveControls();
   applyViewButtons();
 
   requestTimeSync()
@@ -119,37 +214,122 @@ async function requestTimeSync() {
   }
 }
 
-async function refresh() {
-  try {
-    await loadData();
-    state.loading = false;
+const LOADERS = ARCHIVE_AVAILABLE
+  ? { open: loadOpen, archive: loadArchiveState }
+  : { open: loadOpen };
+const pendingParts = new Set();
+
+const isBusy = () => state.prompt?.kind === 'busy';
+
+async function refresh(parts = Object.keys(LOADERS)) {
+  // Long archive operations refresh once when they finish; re-rendering on
+  // every intermediate tab or storage event would only flicker.
+  if (isBusy()) return;
+  await Promise.all(parts.map((part) => LOADERS[part]()));
+  state.loading = false;
+  if (pointerHeld()) {
+    renderDeferred = true;
+    clearTimeout(refreshTimer);
+    refreshTimer = setTimeout(flushRefresh, 100);
+    return;
+  }
+  render();
+}
+
+function scheduleRefresh(part) {
+  pendingParts.add(part);
+  clearTimeout(refreshTimer);
+  refreshTimer = setTimeout(flushRefresh, 80);
+}
+
+// A render replaces the page's buttons, and a button replaced between mousedown
+// and mouseup never gets the click. Tab events arrive several times a second
+// while pages load, so renders wait until the pointer is released. The check
+// sits right before render(), because a refresh started before the press
+// finishes loading during it. The 2 s cap covers a release outside the window
+// that never reports.
+let pointerDownAt = 0;
+let renderDeferred = false;
+
+const pointerHeld = () => pointerDownAt !== 0 && Date.now() - pointerDownAt < 2000;
+
+function flushRefresh() {
+  if (pointerHeld()) {
+    refreshTimer = setTimeout(flushRefresh, 100);
+    return;
+  }
+  if (pendingParts.size > 0) {
+    renderDeferred = false;
+    const parts = [...pendingParts];
+    pendingParts.clear();
+    refresh(parts);
+  } else if (renderDeferred) {
+    renderDeferred = false;
     render();
-  } catch (error) {
-    console.error('Tab Overview: failed to read tabs', error);
-    state.loading = false;
-    renderError(error);
   }
 }
 
-function scheduleRefresh() {
-  clearTimeout(refreshTimer);
-  refreshTimer = setTimeout(refresh, 80);
+function bindPointerHold() {
+  document.addEventListener('pointerdown', () => {
+    pointerDownAt = Date.now();
+  }, true);
+  const release = () => {
+    pointerDownAt = 0;
+    clearTimeout(refreshTimer);
+    refreshTimer = setTimeout(flushRefresh, 0);
+  };
+  document.addEventListener('pointerup', release, true);
+  document.addEventListener('pointercancel', release, true);
 }
 
-async function loadData() {
-  const [windows, groups, selfTab, openedAt] = await Promise.all([
+async function loadOpen() {
+  try {
+    const [windows, openedAt] = await Promise.all([readOpenWindows(), loadTabTimes()]);
+    state.windows = windows;
+    state.openedAt = openedAt;
+    state.openError = null;
+    pruneCollapsed('open', windows);
+  } catch (error) {
+    console.error('Tab Overview: failed to read tabs', error);
+    state.openError = error;
+  }
+}
+
+async function loadArchiveState() {
+  try {
+    const batches = await loadArchive();
+    for (const batch of batches) {
+      const badge = {
+        text: formatShortDate(batch.archivedAt),
+        title: `Archived ${formatDate(batch.archivedAt)}`,
+      };
+      for (const win of batch.windows) win.badge = badge;
+    }
+    state.batches = batches;
+    state.archiveError = null;
+    const live = new Set(batches.flatMap((batch) =>
+      batch.windows.flatMap((win) => win.tabs.map(archivedTabKey))));
+    for (const key of pendingArchivedTabs) {
+      if (!live.has(key)) pendingArchivedTabs.delete(key);
+    }
+    pruneCollapsed('archive', batches.flatMap((batch) => batch.windows));
+  } catch (error) {
+    console.error('Tab Overview: failed to read the archive', error);
+    state.archiveError = error;
+  }
+}
+
+async function readOpenWindows() {
+  const [windows, groups, selfTab] = await Promise.all([
     chrome.windows.getAll({ populate: true }),
     chrome.tabGroups?.query ? chrome.tabGroups.query({}) : Promise.resolve([]),
     chrome.tabs.getCurrent ? chrome.tabs.getCurrent().catch(() => null) : Promise.resolve(null),
-    loadTabTimes(),
   ]);
 
   const selfTabId = selfTab?.id ?? null;
+  const groupsById = new Map(groups.map((group) => [group.id, group]));
 
-  state.groups = new Map(groups.map((group) => [group.id, group]));
-  state.openedAt = openedAt;
-
-  state.windows = windows
+  return windows
     .map((win) => ({
       ...win,
       tabs: (win.tabs || [])
@@ -157,17 +337,57 @@ async function loadData() {
         .sort((a, b) => a.index - b.index),
     }))
     .filter((win) => win.tabs.length > 0)
-    .sort((a, b) => Number(b.focused) - Number(a.focused) || a.id - b.id);
+    .sort((a, b) => Number(b.focused) - Number(a.focused) || a.id - b.id)
+    .map((win, index) => {
+      const title = win.focused ? 'Current window' : `Window ${index + 1}`;
+      return {
+        id: win.id,
+        title,
+        focused: win.focused,
+        incognito: win.incognito,
+        badge: { text: `W${index + 1}`, title },
+        tabs: win.tabs,
+        ...groupTabs(win.tabs, groupsById),
+      };
+    });
+}
 
-  // Drop remembered collapse state for groups that no longer exist.
-  let pruned = false;
-  for (const id of [...state.collapsed]) {
-    if (!state.groups.has(id)) {
-      state.collapsed.delete(id);
-      pruned = true;
+function groupTabs(tabs, groupsById) {
+  const byGroup = new Map();
+  const ungrouped = [];
+
+  for (const tab of tabs) {
+    if (tab.groupId === -1 || tab.groupId === undefined) {
+      ungrouped.push(tab);
+    } else {
+      if (!byGroup.has(tab.groupId)) byGroup.set(tab.groupId, []);
+      byGroup.get(tab.groupId).push(tab);
     }
   }
-  if (pruned) saveCollapsed();
+
+  const groups = [...byGroup.entries()]
+    .map(([id, groupTabs]) => {
+      const meta = groupsById.get(id);
+      return {
+        id,
+        title: meta?.title || '',
+        color: meta?.color || 'grey',
+        tabs: groupTabs,
+        firstIndex: Math.min(...groupTabs.map((tab) => tab.index)),
+      };
+    })
+    .sort((a, b) => a.firstIndex - b.firstIndex);
+
+  return { groups, ungrouped };
+}
+
+function pruneCollapsed(source, windows) {
+  const live = new Set(windows.flatMap((win) => win.groups.map((group) => group.id)));
+  const collapsed = state.collapsed[source];
+  const stale = [...collapsed].filter((id) => !live.has(id));
+  if (stale.length === 0) return;
+  for (const id of stale) collapsed.delete(id);
+  saveSet(SOURCES[source].collapsedKey, collapsed);
 }
 
 async function loadTabTimes() {
@@ -197,7 +417,7 @@ async function loadTabTimes() {
 /* ------------------------------------------------------------------ events */
 
 function bindEvents() {
-  const reload = () => scheduleRefresh();
+  const reload = () => scheduleRefresh('open');
 
   for (const name of ['onCreated', 'onRemoved', 'onMoved', 'onAttached', 'onDetached', 'onActivated']) {
     chrome.tabs[name]?.addListener(reload);
@@ -220,9 +440,12 @@ function bindEvents() {
   }
 
   chrome.storage?.onChanged?.addListener((changes, areaName) => {
-    if (areaName !== 'session') return;
-    if (Object.keys(changes).some((key) => key.startsWith(OPENED_AT_PREFIX))) {
+    const keys = Object.keys(changes);
+    if (areaName === 'session' && keys.some((key) => key.startsWith(OPENED_AT_PREFIX))) {
       reload();
+    }
+    if (areaName === 'local' && ARCHIVE_AVAILABLE && keys.some(isBatchKey)) {
+      scheduleRefresh('archive');
     }
   });
 }
@@ -250,6 +473,20 @@ function bindSearch() {
   });
 
   document.addEventListener('keydown', (event) => {
+    if (event.defaultPrevented) return;
+
+    if (event.key === 'Escape' && state.prompt?.kind === 'confirm') {
+      event.preventDefault();
+      dismissPrompt();
+      return;
+    }
+
+    if (event.key === 'Escape' && state.confirmDeleteBatchId) {
+      event.preventDefault();
+      cancelBatchDelete(state.confirmDeleteBatchId);
+      return;
+    }
+
     if (event.key === 'Escape' && state.query) {
       event.preventDefault();
       clearSearch();
@@ -282,7 +519,7 @@ function bindViewSwitch() {
       const view = button.dataset.view;
       if (!VIEWS.has(view) || view === state.view) return;
       state.view = view;
-      saveView();
+      saveValue(VIEW_KEY, view);
       applyViewButtons();
       render();
     });
@@ -294,7 +531,41 @@ function applyViewButtons() {
     const active = button.dataset.view === state.view;
     button.classList.toggle('is-active', active);
     button.setAttribute('aria-pressed', String(active));
+    if (button.dataset.view === 'windows') {
+      button.textContent = state.source === 'archive' ? 'Batches' : 'Windows';
+    }
   }
+  for (const button of els.sourceButtons) {
+    const active = button.dataset.source === state.source;
+    button.classList.toggle('is-active', active);
+    button.setAttribute('aria-pressed', String(active));
+  }
+}
+
+function bindArchiveControls() {
+  els.sourceSwitch.hidden = !ARCHIVE_AVAILABLE;
+  if (!ARCHIVE_AVAILABLE) return;
+
+  for (const button of els.sourceButtons) {
+    button.addEventListener('click', () => switchSource(button.dataset.source));
+  }
+  els.archiveAll.addEventListener('click', promptArchiveAll);
+  els.archiveExport.addEventListener('click', downloadArchive);
+  els.archiveImport.addEventListener('click', () => els.archiveImportFile.click());
+  els.archiveImportFile.addEventListener('change', () => {
+    const [file] = els.archiveImportFile.files;
+    els.archiveImportFile.value = '';
+    if (file) importArchiveFile(file);
+  });
+}
+
+function switchSource(source) {
+  if (!SOURCE_NAMES.has(source) || source === state.source) return;
+  state.source = source;
+  state.confirmDeleteBatchId = null;
+  saveValue(SOURCE_KEY, source);
+  applyViewButtons();
+  render();
 }
 
 /* ------------------------------------------------------------------ render */
@@ -302,10 +573,10 @@ function applyViewButtons() {
 function render() {
   if (!els.overview) return;
 
-  const focusedTabId = document.activeElement?.closest?.('.tab')?.dataset.tabId || null;
-  const focusedGroupId = document.activeElement?.closest?.('.group-header')?.dataset.groupId || null;
-  const focusedCategoryId = document.activeElement?.closest?.('.category-header')?.dataset.categoryId || null;
-  const query = state.query.trim().toLowerCase();
+  const focus = focusKey();
+  const ctx = sourceContext(state.source);
+  renderControls();
+  renderBanner();
 
   if (state.loading) {
     els.summary.textContent = 'Reading your tabs…';
@@ -313,34 +584,250 @@ function render() {
     return;
   }
 
-  const totalTabs = state.windows.reduce((sum, win) => sum + win.tabs.length, 0);
   els.overview.replaceChildren();
+  renderSource(ctx);
+  restoreFocus(focus);
+}
 
-  if (state.windows.length === 0) {
-    els.overview.append(createEmptyState({
-      icon: ICONS.grid,
-      title: 'No other tabs open',
-      message: 'This is the only tab in your browser right now. Open a page and it will show up here.',
-    }));
-    els.summary.textContent = '0 tabs';
+function sourceContext(source) {
+  return {
+    ...SOURCES[source],
+    source,
+    query: state.query.trim().toLowerCase(),
+    collapsed: state.collapsed[source],
+  };
+}
+
+function renderSource(ctx) {
+  const error = ctx.error();
+  if (error) {
+    renderError(error, ctx.errorTitle);
     return;
   }
 
-  if (state.view === 'sorted') {
-    renderSortedView(query, totalTabs);
-  } else {
-    renderWindowView(query, totalTabs);
+  const windows = ctx.windows();
+  const totalTabs = windows.reduce((sum, win) => sum + win.tabs.length, 0);
+
+  if (totalTabs === 0) {
+    els.overview.append(createEmptyState(ctx.empty));
+    els.summary.textContent = plural(0, ctx.tabNoun);
+    return;
   }
 
-  restoreFocus(focusedTabId, focusedGroupId, focusedCategoryId);
+  const { matched, detail } = state.view === 'sorted'
+    ? renderSortedView(windows, ctx)
+    : ctx.renderWindows(ctx);
+
+  if (matched === 0) {
+    renderEmptySearch(totalTabs, ctx);
+    return;
+  }
+
+  const [one, many] = ctx.containerNoun;
+  els.summary.textContent = ctx.query
+    ? matchSummary(matched, totalTabs, ctx.tabNoun)
+    : `${plural(totalTabs, ctx.tabNoun)} · ${detail} · ${plural(ctx.containerCount(), one, many)}`;
 }
 
-function renderWindowView(query, totalTabs) {
-  const totalGroups = countGroups(state.windows);
+function renderControls() {
+  if (!ARCHIVE_AVAILABLE) return;
+  const busy = isBusy();
+  const archived = state.batches.reduce((sum, batch) => sum + batch.tabCount, 0);
+  els.archiveCount.textContent = String(archived);
+
+  const count = planArchive(state.windows).count;
+  els.archiveAll.hidden = state.source !== 'open';
+  els.archiveAll.disabled = busy || count === 0;
+  els.archiveAll.title = count === 0
+    ? 'No tabs to archive'
+    : `Save ${plural(count, 'tab')} to the archive and close them`;
+
+  els.archiveTools.hidden = state.source !== 'archive';
+  els.archiveExport.disabled = busy || archived === 0;
+  els.archiveImport.disabled = busy;
+
+  els.footerHint.textContent = state.source === 'archive'
+    ? 'Click an archived tab to reopen it'
+    : 'Click a tab to switch to it';
+}
+
+// The confirm prompt recounts on every render, so tabs opened or closed while
+// it is showing are reflected before the user confirms.
+const BANNERS = {
+  confirm: () => {
+    const plan = planArchive(state.windows);
+    if (plan.count === 0) return null;
+    return {
+      text: `Archive and close ${plural(plan.count, 'tab')}?`,
+      detail: leftOpenText(plan.skipped, 'stay open'),
+      buttons: [
+      { id: 'archive-confirm', label: 'Archive and close', primary: true, onClick: confirmArchiveAll },
+        { id: 'archive-cancel', label: 'Cancel', onClick: dismissPrompt },
+      ],
+    };
+  },
+  busy: (prompt) => ({ text: prompt.text, buttons: [] }),
+  result: (prompt) => ({
+    text: prompt.text,
+    detail: prompt.detail,
+    tone: prompt.tone,
+    buttons: [{ id: 'banner-dismiss', label: 'Dismiss', onClick: dismissPrompt }],
+  }),
+};
+
+function renderBanner() {
+  const view = state.prompt && BANNERS[state.prompt.kind](state.prompt);
+  if (!view) state.prompt = null;
+  const prompt = state.prompt;
+  els.banner.hidden = !prompt;
+  if (!prompt) {
+    els.banner.replaceChildren();
+    return;
+  }
+
+  const banner = el('div', 'banner');
+  banner.dataset.kind = prompt.kind;
+  if (view.tone) banner.dataset.tone = view.tone;
+
+  const text = el('div', 'banner-text');
+  const strong = el('strong');
+  strong.textContent = view.text;
+  text.append(strong);
+  if (view.detail) {
+    const detail = el('span', 'banner-detail');
+    detail.textContent = view.detail;
+    text.append(detail);
+  }
+
+  const buttons = el('div', 'banner-actions');
+  for (const spec of view.buttons) {
+    const button = createButton(spec.label, spec.onClick, spec.primary ? 'is-primary' : '');
+    button.id = spec.id;
+    buttons.append(button);
+  }
+
+  banner.append(text, buttons);
+  els.banner.replaceChildren(banner);
+}
+
+function dismissPrompt() {
+  if (isBusy()) return;
+  state.prompt = null;
+  render();
+  focusFirst(['#archive-all:not([hidden]):not(:disabled)', '#search']);
+}
+
+function focusFirst(selectors) {
+  for (const selector of selectors) {
+    const target = document.querySelector(selector);
+    if (target) {
+      target.focus({ preventScroll: true });
+      return;
+    }
+  }
+}
+
+function createButton(label, onClick, modifier = '') {
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.className = `button ${modifier}`.trim();
+  button.textContent = label;
+  button.disabled = isBusy();
+  button.addEventListener('click', onClick);
+  return button;
+}
+
+const SKIP_LABELS = {
+  pinned: ['pinned', 'pinned'],
+  private: ['private', 'private'],
+  unsupported: ['browser or local page', 'browser or local pages'],
+};
+
+function leftOpenText(skipped, verb) {
+  const parts = Object.entries(skipped)
+    .filter(([, count]) => count > 0)
+    .map(([reason, count]) => `${count} ${SKIP_LABELS[reason][count === 1 ? 0 : 1]}`);
+  if (parts.length === 0) return '';
+  const total = Object.values(skipped).reduce((sum, count) => sum + count, 0);
+  return `${plural(total, 'tab')} ${verb}: ${parts.join(', ')}.`;
+}
+
+function renderBatchesView(ctx) {
+  let matched = 0;
+  let groups = 0;
+
+  for (const batch of state.batches) {
+    const { sections, matched: count } = filterWindows(batch.windows, ctx.query);
+    if (count === 0) continue;
+    matched += count;
+    groups += countGroups(batch.windows);
+    els.overview.append(renderBatch(batch, sections, count, ctx));
+  }
+
+  return { matched, detail: plural(groups, 'group') };
+}
+
+function renderBatch(batch, sections, count, ctx) {
+  const section = el('section', 'batch');
+  section.dataset.batchId = batch.id;
+
+  const head = el('div', 'batch-head');
+  const heading = document.createElement('h2');
+  const tabs = count === batch.tabCount
+    ? plural(count, 'tab')
+    : `${count} of ${plural(batch.tabCount, 'tab')}`;
+  heading.textContent = `${formatDate(batch.archivedAt)} · ${tabs}`;
+  heading.title = `Archived ${new Date(batch.archivedAt).toLocaleString()}`;
+
+  const actions = el('div', 'batch-actions');
+  if (state.confirmDeleteBatchId === batch.id) {
+    const question = el('span', 'batch-question');
+    question.textContent = `Delete ${plural(batch.tabCount, 'archived tab')}?`;
+    actions.append(
+      question,
+      createButton('Delete', () => deleteArchivedBatch(batch), 'is-danger batch-delete-confirm'),
+      createButton('Cancel', () => cancelBatchDelete(batch.id), 'batch-delete-cancel'),
+    );
+  } else {
+    const restore = createButton('Restore', () => restoreArchivedBatch(batch), 'batch-restore');
+    restore.title = `Reopen ${plural(batch.tabCount, 'tab')} in ${plural(batch.windows.length, 'window')}`;
+    actions.append(
+      restore,
+      createButton('Delete', () => {
+        state.confirmDeleteBatchId = batch.id;
+        render();
+        els.overview
+          .querySelector(`[data-batch-id="${CSS.escape(batch.id)}"] .batch-delete-cancel`)
+          ?.focus();
+      }, 'batch-delete'),
+    );
+  }
+
+  head.append(heading, actions);
+  section.append(head);
+  for (const windowSection of sections) section.append(renderWindow(windowSection, ctx));
+  return section;
+}
+
+function cancelBatchDelete(batchId) {
+  state.confirmDeleteBatchId = null;
+  render();
+  focusFirst([`[data-batch-id="${CSS.escape(batchId)}"] .batch-delete`, '#search']);
+}
+
+function renderWindowView(ctx) {
+  const { sections, matched } = filterWindows(state.windows, ctx.query);
+  for (const section of sections) {
+    els.overview.append(renderWindow(section, ctx));
+  }
+  return { matched, detail: plural(countGroups(state.windows), 'group') };
+}
+
+function filterWindows(windows, query) {
   const sections = [];
   let matched = 0;
 
-  for (const win of state.windows) {
+  for (const win of windows) {
     const filtered = filterWindow(win, query);
     const count = countVisible(filtered);
     if (count === 0) continue;
@@ -348,77 +835,68 @@ function renderWindowView(query, totalTabs) {
     sections.push({ win, ...filtered, count });
   }
 
-  if (sections.length === 0) {
-    renderEmptySearch(totalTabs);
-    return;
-  }
-
-  for (const section of sections) {
-    els.overview.append(renderWindow(section));
-  }
-
-  els.summary.textContent = query
-    ? matchSummary(matched, totalTabs)
-    : `${plural(totalTabs, 'tab')} · ${plural(totalGroups, 'group')} · ${plural(state.windows.length, 'window')}`;
+  return { sections, matched };
 }
 
-function renderSortedView(query, totalTabs) {
-  const categories = buildCategories(query);
-
-  if (categories.length === 0) {
-    renderEmptySearch(totalTabs);
-    return;
-  }
-
-  const matched = categories.reduce((sum, bucket) => sum + bucket.tabs.length, 0);
-
+function renderSortedView(windows, ctx) {
+  const categories = buildCategories(windows, ctx.query);
   for (const bucket of categories) {
-    els.overview.append(renderCategory(bucket, query));
+    els.overview.append(renderCategory(bucket, ctx));
   }
-
-  els.summary.textContent = query
-    ? matchSummary(matched, totalTabs)
-    : `${plural(totalTabs, 'tab')} · ${plural(categories.length, 'category', 'categories')} · ${plural(state.windows.length, 'window')}`;
+  return {
+    matched: categories.reduce((sum, bucket) => sum + bucket.tabs.length, 0),
+    detail: plural(categories.length, 'category', 'categories'),
+  };
 }
 
-function renderEmptySearch(totalTabs) {
+function renderEmptySearch(totalTabs, ctx) {
   els.overview.append(createEmptyState({
     icon: ICONS.search,
-    title: `No tabs match “${state.query.trim()}”`,
+    title: `No ${ctx.tabNoun}s match “${state.query.trim()}”`,
     message: 'Try a shorter search, or search by site address.',
     actionLabel: 'Clear search',
     onAction: clearSearch,
   }));
-  els.summary.textContent = matchSummary(0, totalTabs);
+  els.summary.textContent = matchSummary(0, totalTabs, ctx.tabNoun);
 }
 
-function restoreFocus(focusedTabId, focusedGroupId, focusedCategoryId) {
-  if (focusedTabId) {
-    els.overview
-      .querySelector(`.tab[data-tab-id="${focusedTabId}"]`)
-      ?.focus({ preventScroll: true });
-  } else if (focusedGroupId) {
-    els.overview
-      .querySelector(`.group-header[data-group-id="${focusedGroupId}"]`)
-      ?.focus({ preventScroll: true });
-  } else if (focusedCategoryId) {
-    els.overview
-      .querySelector(`.category-header[data-category-id="${focusedCategoryId}"]`)
-      ?.focus({ preventScroll: true });
+const FOCUS_SCOPES = ['data-tab-id', 'data-group-id', 'data-category-id', 'data-batch-id'];
+
+// Every render rebuilds the overview, so focus is remembered as a selector and
+// put back on the equivalent new element.
+function focusKey() {
+  const active = document.activeElement;
+  if (!(active instanceof HTMLElement) || active === document.body) return null;
+  if (active.id) return `#${CSS.escape(active.id)}`;
+
+  for (const attr of FOCUS_SCOPES) {
+    const scope = active.closest(`[${attr}]`);
+    if (!scope) continue;
+    const base = `[${attr}="${CSS.escape(scope.getAttribute(attr))}"]`;
+    if (scope === active) return base;
+    const classes = [...active.classList].map((name) => `.${CSS.escape(name)}`).join('');
+    return classes ? `${base} ${classes}` : null;
   }
+  return null;
 }
 
-function buildCategories(query) {
+function restoreFocus(key) {
+  if (!key) return;
+  const target = document.querySelector(key);
+  if (target && target !== document.activeElement) target.focus({ preventScroll: true });
+}
+
+function buildCategories(windows, query) {
   const buckets = new Map();
 
-  for (const win of state.windows) {
-    const windowIndex = state.windows.indexOf(win) + 1;
+  for (const win of windows) {
+    const groupTitles = new Map(win.groups.map((group) => [group.id, group.title]));
 
     for (const tab of win.tabs) {
       const category = categorizeTab(tab);
       const categoryMatches = category.label.toLowerCase().includes(query);
 
-      if (query && !categoryMatches && !tabMatchesQuery(tab, query)) continue;
+      if (query && !categoryMatches && !tabMatchesQuery(tab, groupTitles.get(tab.groupId), query)) continue;
 
       if (!buckets.has(category.id)) {
         buckets.set(category.id, {
@@ -429,7 +907,7 @@ function buildCategories(query) {
       }
 
       const bucket = buckets.get(category.id);
-      bucket.tabs.push({ tab, win, windowIndex });
+      bucket.tabs.push({ tab, win });
       bucket.windows.add(win.id);
     }
   }
@@ -439,18 +917,17 @@ function buildCategories(query) {
   );
 }
 
-function tabMatchesQuery(tab, query) {
-  const group = state.groups.get(tab.groupId);
+function tabMatchesQuery(tab, groupTitle, query) {
   return (tab.title || '').toLowerCase().includes(query) ||
     (tab.url || '').toLowerCase().includes(query) ||
-    (group?.title || '').toLowerCase().includes(query);
+    (groupTitle || '').toLowerCase().includes(query);
 }
 
-function renderCategory({ meta, tabs }, query) {
+function renderCategory({ meta, tabs }, ctx) {
   const section = el('section', 'category');
   section.dataset.category = meta.id;
 
-  const isCollapsed = query === '' && state.collapsedCategories.has(meta.id);
+  const isCollapsed = ctx.query === '' && state.collapsedCategories.has(meta.id);
   if (isCollapsed) section.classList.add('is-collapsed');
 
   const header = document.createElement('button');
@@ -475,13 +952,8 @@ function renderCategory({ meta, tabs }, query) {
 
   if (!isCollapsed) {
     const grid = el('div', 'group-tabs');
-    for (const { tab, win, windowIndex } of tabs) {
-      grid.append(renderTab(tab, {
-        windowBadge: {
-          text: `W${windowIndex}`,
-          title: win.focused ? 'Current window' : `Window ${windowIndex}`,
-        },
-      }));
+    for (const { tab, win } of tabs) {
+      grid.append(renderTab(tab, ctx, { windowBadge: win.badge }));
     }
     section.append(grid);
   }
@@ -495,56 +967,26 @@ function toggleCategory(categoryId) {
   } else {
     state.collapsedCategories.add(categoryId);
   }
-  saveCollapsedCategories();
+  saveSet(COLLAPSED_CATEGORIES_KEY, state.collapsedCategories);
   render();
 }
 
 function filterWindow(win, query) {
-  const { groups, ungrouped } = groupTabsForWindow(win);
+  const { groups, ungrouped } = win;
   if (!query) return { groups, ungrouped };
-
-  const matches = (tab, groupTitle) =>
-    (tab.title || '').toLowerCase().includes(query) ||
-    (tab.url || '').toLowerCase().includes(query) ||
-    (groupTitle || '').toLowerCase().includes(query);
 
   return {
     groups: groups
       .map((group) => ({
         ...group,
-        tabs: group.tabs.filter((tab) => matches(tab, group.meta.title)),
+        tabs: group.tabs.filter((tab) => tabMatchesQuery(tab, group.title, query)),
       }))
       .filter((group) => group.tabs.length > 0),
-    ungrouped: ungrouped.filter((tab) => matches(tab, '')),
+    ungrouped: ungrouped.filter((tab) => tabMatchesQuery(tab, '', query)),
   };
 }
 
-function groupTabsForWindow(win) {
-  const byGroup = new Map();
-  const ungrouped = [];
-
-  for (const tab of win.tabs) {
-    if (tab.groupId === -1 || tab.groupId === undefined) {
-      ungrouped.push(tab);
-    } else {
-      if (!byGroup.has(tab.groupId)) byGroup.set(tab.groupId, []);
-      byGroup.get(tab.groupId).push(tab);
-    }
-  }
-
-  const groups = [...byGroup.entries()]
-    .map(([id, tabs]) => ({
-      id,
-      meta: state.groups.get(id) || { id, title: '', color: 'grey' },
-      tabs,
-      firstIndex: Math.min(...tabs.map((tab) => tab.index)),
-    }))
-    .sort((a, b) => a.firstIndex - b.firstIndex);
-
-  return { groups, ungrouped };
-}
-
-function renderWindow({ win, groups, ungrouped, count }) {
+function renderWindow({ win, groups, ungrouped, count }, ctx) {
   const section = el('section', 'window');
   if (win.focused) section.classList.add('is-focused');
 
@@ -553,9 +995,7 @@ function renderWindow({ win, groups, ungrouped, count }) {
   titleWrap.append(el('span', 'window-dot'));
 
   const heading = document.createElement('h2');
-  heading.textContent = win.focused
-    ? 'Current window'
-    : `Window ${state.windows.indexOf(win) + 1}`;
+  heading.textContent = win.title;
   titleWrap.append(heading);
 
   if (win.incognito) {
@@ -581,19 +1021,19 @@ function renderWindow({ win, groups, ungrouped, count }) {
   section.append(head);
 
   const body = el('div', 'window-body');
-  for (const group of groups) body.append(renderGroup(group));
-  if (ungrouped.length > 0) body.append(renderUngrouped(ungrouped, groups.length > 0));
+  for (const group of groups) body.append(renderGroup(group, ctx));
+  if (ungrouped.length > 0) body.append(renderUngrouped(ungrouped, groups.length > 0, ctx));
   section.append(body);
 
   return section;
 }
 
-function renderGroup(group) {
+function renderGroup(group, ctx) {
   const section = el('section', 'group');
-  const color = VALID_COLORS.has(group.meta.color) ? group.meta.color : 'grey';
+  const color = GROUP_COLORS.has(group.color) ? group.color : 'grey';
   section.dataset.color = color;
 
-  const isCollapsed = state.query.trim() === '' && state.collapsed.has(group.id);
+  const isCollapsed = ctx.query === '' && ctx.collapsed.has(group.id);
   if (isCollapsed) section.classList.add('is-collapsed');
 
   const header = document.createElement('button');
@@ -603,7 +1043,7 @@ function renderGroup(group) {
   header.setAttribute('aria-expanded', String(!isCollapsed));
   header.setAttribute(
     'aria-label',
-    `${group.meta.title || 'Untitled group'}, ${plural(group.tabs.length, 'tab')}`,
+    `${group.title || 'Untitled group'}, ${plural(group.tabs.length, 'tab')}`,
   );
 
   const chevron = el('span', 'group-chevron');
@@ -611,24 +1051,24 @@ function renderGroup(group) {
 
   const dot = el('span', 'group-dot');
   const name = el('span', 'group-name');
-  name.textContent = group.meta.title || 'Untitled group';
+  name.textContent = group.title || 'Untitled group';
   const count = el('span', 'group-count');
   count.textContent = String(group.tabs.length);
 
   header.append(chevron, dot, name, count);
-  header.addEventListener('click', () => toggleGroup(group.id));
+  header.addEventListener('click', () => toggleGroup(ctx, group.id));
   section.append(header);
 
   if (!isCollapsed) {
     const tabs = el('div', 'group-tabs');
-    for (const tab of group.tabs) tabs.append(renderTab(tab));
+    for (const tab of group.tabs) tabs.append(renderTab(tab, ctx));
     section.append(tabs);
   }
 
   return section;
 }
 
-function renderUngrouped(tabs, showLabel) {
+function renderUngrouped(tabs, showLabel, ctx) {
   const section = el('section', 'group group-ungrouped');
   if (showLabel) section.classList.add('has-label');
 
@@ -643,15 +1083,17 @@ function renderUngrouped(tabs, showLabel) {
   }
 
   const grid = el('div', 'group-tabs');
-  for (const tab of tabs) grid.append(renderTab(tab));
+  for (const tab of tabs) grid.append(renderTab(tab, ctx));
   section.append(grid);
 
   return section;
 }
 
-function renderTab(tab, options = {}) {
+function renderTab(tab, ctx, options = {}) {
+  const { actions } = ctx;
   const card = el('div', 'tab');
   card.dataset.tabId = String(tab.id);
+  if (ctx.source === 'archive') card.dataset.archiveId = tab.id;
 
   const titleText = tab.title?.trim() || displayUrl(tab.url) || 'Untitled tab';
   card.title = [tab.title?.trim(), tab.url].filter(Boolean).join('\n');
@@ -662,7 +1104,7 @@ function renderTab(tab, options = {}) {
   const main = el('div', 'tab-main');
   main.tabIndex = 0;
   main.setAttribute('role', 'button');
-  main.setAttribute('aria-label', `Switch to ${titleText}`);
+  main.setAttribute('aria-label', `${actions.activateLabel} ${titleText}`);
 
   main.append(createFavicon(tab));
 
@@ -681,7 +1123,7 @@ function renderTab(tab, options = {}) {
   if (flags.childElementCount > 0) titleRow.append(flags);
 
   const urlText = displayUrl(tab.url);
-  const opened = state.openedAt.get(tab.id);
+  const age = ctx.ageOf(tab);
 
   text.append(titleRow);
 
@@ -692,17 +1134,17 @@ function renderTab(tab, options = {}) {
     meta.append(url);
   }
 
-  if (opened) {
-    const age = el('span', 'tab-age');
-    if (opened.approximate) {
-      age.textContent = 'Before tracking';
-      age.title = 'This tab was already open when Tab Overview started tracking.';
+  if (age) {
+    const ageEl = el('span', 'tab-age');
+    ageEl.title = age.title;
+    if (typeof age.since === 'number') {
+      ageEl.textContent = age.prefix + formatAge(age.since);
+      ageEl.dataset.since = String(age.since);
+      ageEl.dataset.prefix = age.prefix;
     } else {
-      age.textContent = formatAge(opened.openedAt);
-      age.title = `Opened ${new Date(opened.openedAt).toLocaleString()}`;
-      age.dataset.openedAt = String(opened.openedAt);
+      ageEl.textContent = age.text;
     }
-    meta.append(age);
+    meta.append(ageEl);
   }
 
   if (options.windowBadge) {
@@ -715,30 +1157,57 @@ function renderTab(tab, options = {}) {
   if (meta.childElementCount > 0) text.append(meta);
 
   main.append(text);
-  main.addEventListener('click', () => activateTab(tab));
+  main.addEventListener('click', () => actions.activate(tab));
   main.addEventListener('keydown', (event) => {
     if (event.key === 'Enter' || event.key === ' ') {
       event.preventDefault();
-      activateTab(tab);
+      actions.activate(tab);
     }
   });
 
   const close = document.createElement('button');
   close.type = 'button';
   close.className = 'tab-close';
-  close.setAttribute('aria-label', `Close ${titleText}`);
+  close.title = actions.dismissLabel;
+  close.setAttribute('aria-label', `${actions.dismissLabel} ${titleText}`);
   close.append(createIcon(ICONS.close));
-  close.addEventListener('click', () => closeTab(tab));
+  close.addEventListener('click', () => actions.dismiss(tab));
 
   card.append(main, close);
-  card.addEventListener('auxclick', (event) => {
-    if (event.button === 1) {
-      event.preventDefault();
-      closeTab(tab);
-    }
-  });
+  if (actions.middleClick) {
+    card.addEventListener('auxclick', (event) => {
+      if (event.button === 1) {
+        event.preventDefault();
+        actions.middleClick(tab);
+      }
+    });
+  }
 
   return card;
+}
+
+function archivedAge(tab) {
+  return {
+    since: tab.archivedAt,
+    prefix: 'archived ',
+    title: `Archived ${new Date(tab.archivedAt).toLocaleString()}`,
+  };
+}
+
+function openedAge(tab) {
+  const opened = state.openedAt.get(tab.id);
+  if (!opened) return null;
+  if (opened.approximate) {
+    return {
+      text: 'Before tracking',
+      title: 'This tab was already open when Tab Overview started tracking.',
+    };
+  }
+  return {
+    since: opened.openedAt,
+    prefix: '',
+    title: `Opened ${new Date(opened.openedAt).toLocaleString()}`,
+  };
 }
 
 function createFavicon(tab) {
@@ -825,11 +1294,11 @@ function renderUnsupported() {
   }));
 }
 
-function renderError(error) {
+function renderError(error, title) {
   els.summary.textContent = 'Something went wrong';
   els.overview.replaceChildren(createEmptyState({
     icon: ICONS.alert,
-    title: 'Couldn’t read your tabs',
+    title,
     message: error?.message || 'Chrome blocked access to the tabs API.',
     actionLabel: 'Try again',
     onAction: () => {
@@ -848,7 +1317,7 @@ async function activateTab(tab) {
     await chrome.windows.update(tab.windowId, { focused: true });
   } catch (error) {
     console.warn('Tab Overview: could not switch to tab', error);
-    scheduleRefresh();
+    scheduleRefresh('open');
   }
 }
 
@@ -857,17 +1326,174 @@ async function closeTab(tab) {
     await chrome.tabs.remove(tab.id);
   } catch (error) {
     console.warn('Tab Overview: could not close tab', error);
-    scheduleRefresh();
+    scheduleRefresh('open');
   }
 }
 
-function toggleGroup(groupId) {
-  if (state.collapsed.has(groupId)) {
-    state.collapsed.delete(groupId);
-  } else {
-    state.collapsed.add(groupId);
+function promptArchiveAll() {
+  if (isBusy()) return;
+  if (planArchive(state.windows).count === 0) return;
+  state.prompt = { kind: 'confirm' };
+  render();
+  document.getElementById('archive-confirm')?.focus();
+}
+
+async function confirmArchiveAll() {
+  if (isBusy()) return;
+  state.prompt = { kind: 'busy', text: 'Archiving tabs…' };
+  render();
+
+  let result;
+  try {
+    // Re-read so tabs opened or closed since the confirmation are accounted for.
+    const plan = planArchive(await readOpenWindows());
+    const { archived, closeFailed } = await archivePlan(plan);
+    const notes = [leftOpenText(plan.skipped, 'left open')];
+    if (closeFailed > 0) {
+      notes.push(`${plural(closeFailed, 'archived tab')} changed or could not be closed and ` +
+        `${closeFailed === 1 ? 'is' : 'are'} still open.`);
+    }
+    result = {
+      kind: 'result',
+      text: `Archived ${plural(archived, 'tab')}`,
+      detail: notes.filter(Boolean).join(' '),
+      tone: closeFailed > 0 ? 'warn' : '',
+    };
+    if (archived > 0) {
+      state.source = 'archive';
+      saveValue(SOURCE_KEY, 'archive');
+      applyViewButtons();
+    }
+  } catch (error) {
+    console.error('Tab Overview: archive failed', error);
+    result = {
+      kind: 'result',
+      text: 'Nothing was archived and no tab was closed',
+      detail: error?.message || '',
+      tone: 'error',
+    };
   }
-  saveCollapsed();
+
+  state.prompt = result;
+  await refresh();
+  focusFirst(['#banner-dismiss']);
+}
+
+async function restoreArchivedBatch(batch) {
+  if (isBusy()) return;
+  state.prompt = { kind: 'busy', text: `Restoring ${plural(batch.tabCount, 'tab')}…` };
+  render();
+
+  let result;
+  try {
+    const { restored, failed, windows } = await restoreBatch(batch.id);
+    result = {
+      kind: 'result',
+      text: restored + failed === 0
+        ? 'This batch was already restored or deleted'
+        : `Restored ${plural(restored, 'tab')} in ${plural(windows, 'window')}`,
+      detail: failed > 0 ? `${plural(failed, 'tab')} could not be opened and stay in the archive.` : '',
+      tone: failed > 0 ? 'warn' : '',
+    };
+  } catch (error) {
+    console.error('Tab Overview: restore failed', error);
+    result = { kind: 'result', text: 'Could not restore the batch', detail: error?.message || '', tone: 'error' };
+  }
+
+  state.prompt = result;
+  await refresh();
+  focusFirst(['#banner-dismiss']);
+}
+
+async function deleteArchivedBatch(batch) {
+  if (isBusy()) return;
+  state.confirmDeleteBatchId = null;
+  try {
+    await deleteBatch(batch.id);
+  } catch (error) {
+    console.error('Tab Overview: could not delete batch', error);
+    state.prompt = { kind: 'result', text: 'Could not delete the batch', detail: error?.message || '', tone: 'error' };
+  }
+  await refresh(['archive']);
+  focusFirst(['#banner-dismiss', '#search']);
+}
+
+async function openArchivedTab(tab) {
+  await changeArchivedTab(tab, reopenArchivedTab, 'could not reopen archived tab');
+}
+
+async function deleteArchivedTab(tab) {
+  await changeArchivedTab(tab, (target) => removeArchivedTabs(target.batchId, [target.id]),
+    'could not remove archived tab');
+}
+
+// The card stays on screen until the next archive load; until then a second
+// click would act on the same tab again.
+async function changeArchivedTab(tab, change, failure) {
+  const key = archivedTabKey(tab);
+  if (isBusy() || pendingArchivedTabs.has(key)) return;
+  pendingArchivedTabs.add(key);
+  try {
+    await change(tab);
+  } catch (error) {
+    pendingArchivedTabs.delete(key);
+    console.warn(`Tab Overview: ${failure}`, error);
+  }
+  scheduleRefresh('archive');
+}
+
+function archivedTabKey(tab) {
+  return `${tab.batchId}:${tab.id}`;
+}
+
+async function downloadArchive() {
+  if (isBusy()) return;
+  try {
+    const backup = await exportArchive();
+    const blob = new Blob([JSON.stringify(backup, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `tab-archive-${isoDate(new Date())}.json`;
+    document.body.append(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 10_000);
+  } catch (error) {
+    console.error('Tab Overview: export failed', error);
+    state.prompt = { kind: 'result', text: 'Could not export the archive', detail: error?.message || '', tone: 'error' };
+    render();
+  }
+}
+
+async function importArchiveFile(file) {
+  if (isBusy()) return;
+  let result;
+  try {
+    const { batches, tabs, skipped, invalid } = await importArchive(await file.text());
+    const notes = [];
+    if (skipped > 0) notes.push(`${plural(skipped, 'batch', 'batches')} already in the archive were skipped.`);
+    if (invalid > 0) notes.push(`${plural(invalid, 'batch', 'batches')} had no tabs that can be reopened.`);
+    result = {
+      kind: 'result',
+      text: `Imported ${plural(batches, 'batch', 'batches')}, ${plural(tabs, 'tab')}`,
+      detail: notes.join(' '),
+      tone: '',
+    };
+  } catch (error) {
+    result = { kind: 'result', text: 'Nothing was imported', detail: error?.message || '', tone: 'error' };
+  }
+  state.prompt = result;
+  await refresh(['archive']);
+}
+
+function toggleGroup(ctx, groupId) {
+  if (ctx.collapsed.has(groupId)) {
+    ctx.collapsed.delete(groupId);
+  } else {
+    ctx.collapsed.add(groupId);
+  }
+  saveSet(ctx.collapsedKey, ctx.collapsed);
   render();
 }
 
@@ -881,74 +1507,50 @@ function isSelfTab(tab) {
     /^(?:chrome|brave|edge|opera|vivaldi):\/\/new-?tab/.test(url);
 }
 
-function loadCollapsed() {
+function loadSet(key, normalize) {
   try {
-    const raw = localStorage.getItem(COLLAPSED_KEY);
+    const raw = localStorage.getItem(key);
     const ids = raw ? JSON.parse(raw) : [];
     return new Set(
-      Array.isArray(ids) ? ids.map(Number).filter(Number.isFinite) : [],
+      Array.isArray(ids) ? ids.map(normalize).filter((id) => id !== null) : [],
     );
   } catch {
     return new Set();
   }
 }
 
-function saveCollapsed() {
+function saveSet(key, set) {
+  saveValue(key, JSON.stringify([...set]));
+}
+
+function toNumberId(value) {
+  const id = Number(value);
+  return Number.isFinite(id) ? id : null;
+}
+
+function toStringId(value) {
+  return typeof value === 'string' ? value : null;
+}
+
+function loadChoice(key, allowed, fallback) {
   try {
-    localStorage.setItem(COLLAPSED_KEY, JSON.stringify([...state.collapsed]));
+    const value = localStorage.getItem(key);
+    return allowed.has(value) ? value : fallback;
   } catch {
-    // Storage can be unavailable in private or restricted contexts.
+    return fallback;
   }
 }
 
-function loadCollapsedCategories() {
+function saveValue(key, value) {
   try {
-    const raw = localStorage.getItem(COLLAPSED_CATEGORIES_KEY);
-    const ids = raw ? JSON.parse(raw) : [];
-    return new Set(
-      Array.isArray(ids) ? ids.filter((id) => typeof id === 'string') : [],
-    );
-  } catch {
-    return new Set();
-  }
-}
-
-function saveCollapsedCategories() {
-  try {
-    localStorage.setItem(
-      COLLAPSED_CATEGORIES_KEY,
-      JSON.stringify([...state.collapsedCategories]),
-    );
-  } catch {
-    // Storage can be unavailable in private or restricted contexts.
-  }
-}
-
-function loadView() {
-  try {
-    const value = localStorage.getItem(VIEW_KEY);
-    return VIEWS.has(value) ? value : 'windows';
-  } catch {
-    return 'windows';
-  }
-}
-
-function saveView() {
-  try {
-    localStorage.setItem(VIEW_KEY, state.view);
+    localStorage.setItem(key, value);
   } catch {
     // Storage can be unavailable in private or restricted contexts.
   }
 }
 
 function countGroups(windows) {
-  const ids = new Set();
-  for (const win of windows) {
-    for (const tab of win.tabs) {
-      if (tab.groupId !== -1 && tab.groupId !== undefined) ids.add(tab.groupId);
-    }
-  }
-  return ids.size;
+  return windows.reduce((sum, win) => sum + win.groups.length, 0);
 }
 
 function countVisible({ groups, ungrouped }) {
@@ -957,6 +1559,23 @@ function countVisible({ groups, ungrouped }) {
 
 function plural(count, word, pluralWord = `${word}s`) {
   return `${count} ${count === 1 ? word : pluralWord}`;
+}
+
+function formatDate(timestamp) {
+  const date = new Date(timestamp);
+  const pad = (value) => String(value).padStart(2, '0');
+  return `${formatShortDate(timestamp)} ${date.getFullYear()}, ` +
+    `${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+function formatShortDate(timestamp) {
+  const date = new Date(timestamp);
+  return `${date.getDate()} ${MONTHS[date.getMonth()]}`;
+}
+
+function isoDate(date) {
+  const pad = (value) => String(value).padStart(2, '0');
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
 }
 
 function formatAge(openedAt) {
@@ -981,14 +1600,14 @@ function formatAge(openedAt) {
 function updateAges() {
   if (document.visibilityState !== 'visible') return;
 
-  for (const node of document.querySelectorAll('.tab-age[data-opened-at]')) {
-    const openedAt = Number(node.dataset.openedAt);
-    if (Number.isFinite(openedAt)) node.textContent = formatAge(openedAt);
+  for (const node of document.querySelectorAll('.tab-age[data-since]')) {
+    const since = Number(node.dataset.since);
+    if (Number.isFinite(since)) node.textContent = (node.dataset.prefix || '') + formatAge(since);
   }
 }
 
-function matchSummary(matched, total) {
-  return `${matched} of ${plural(total, 'tab')} ${matched === 1 ? 'matches' : 'match'}`;
+function matchSummary(matched, total, noun) {
+  return `${matched} of ${plural(total, noun)} ${matched === 1 ? 'matches' : 'match'}`;
 }
 
 function displayUrl(url) {

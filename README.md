@@ -18,6 +18,7 @@ Manifest V3 exposes everything this needs:
 | Read tabs, titles, URLs, windows | `chrome.tabs` + `chrome.windows` (`"tabs"` permission) |
 | Read tab groups and colors | `chrome.tabGroups` (`"tabGroups"` permission) |
 | Track when tabs were opened | `chrome.tabs.onCreated` + `chrome.storage.session` (`"storage"` permission) |
+| Keep archived tabs | `chrome.storage.local` (`"storage"` + `"unlimitedStorage"` permissions) |
 | Local favicons | `chrome-extension://<id>/_favicon/` (`"favicon"` permission) in Chrome, the tab's `data:` favicon in Firefox |
 
 No host permissions and no network access are required. Brave, Edge, and other
@@ -74,6 +75,18 @@ The package is written to `web-ext-artifacts/`.
 - Collapse a category in the sorted view; the state is remembered locally.
 - The selected view and collapse choices persist across page loads.
 - Live updates as tabs are opened, closed, moved, grouped, or renamed.
+- **Archive all** closes every open tab and keeps it in the archive. Pinned
+  tabs, private-window tabs, the overview itself, and pages that can't be
+  reopened later (anything not `http:` or `https:`) stay open. A tab is closed
+  only after the archive was saved.
+- The **Archive** view shows archived tabs with the same grouping: one section
+  per archive batch with its windows and tab groups, or the **Sorted** view
+  across all batches. Search works the same way as for open tabs.
+- Click an archived tab to reopen it, or remove it with the × button.
+  **Restore** reopens a whole batch, one window per archived window, with its
+  tab groups. In Firefox the restored tabs stay unloaded until you open them.
+- **Export** downloads the archive as a JSON backup file. **Import** adds the
+  batches from a backup and skips batches that are already in the archive.
 - Automatic light and dark theme.
 
 ## How the sorted view categorizes tabs
@@ -107,8 +120,15 @@ The rules live in `categories.js`, so you can add domains or keywords there.
   requests are made to websites. This permission is Chrome-only. Firefox ignores
   it with a warning, and the page uses the `data:` favicon Firefox already
   provides for each tab, so Firefox makes no favicon requests to websites either.
-- `storage` — keep tab open timestamps in session storage. This data is cleared
-  when the browser exits and never leaves the machine.
+- `storage` — keep tab open timestamps in session storage, and the tab archive
+  in the extension's local storage. Session data is cleared when the browser
+  exits. Neither leaves the machine.
+- `unlimitedStorage` — let the archive grow past Chrome's 10 MB local storage
+  quota. Archived favicons are stored as image data.
+
+The archive lives in the extension's local storage. It survives browser
+restarts, and it is not synced. Removing the extension deletes the archive, so
+use **Export** to keep a backup file before you uninstall or reinstall it.
 
 The background service worker records tab open times and removes them when tabs
 close. There are no analytics, no external requests, and no host permissions. The
@@ -135,6 +155,11 @@ is visible.
 - Firefox 140 or newer is required. Tab groups use Firefox's tab groups feature,
   which shipped in Firefox 139.
 - Pages without a favicon show a letter badge in both browsers.
+- Archived tabs keep their title, address, and (in Firefox) favicon. Page
+  state such as scroll position, form input, and back/forward history is not
+  kept.
+- In the archive, a window's grouped tabs are listed before its ungrouped tabs,
+  and a restored window opens them in that order.
 
 ## Files
 
@@ -145,6 +170,7 @@ categories.js     Domain and keyword rules for the sorted view
 newtab.html       Page shell
 newtab.css        Light/dark responsive styling
 newtab.js         Data loading, rendering, search, views, and tab actions
+archive.js        Tab archive storage, archive all, restore, export, and import
 icons/            Extension icons (SVG source + PNG sizes)
 screenshot.png    Window view preview
 screenshot-sorted.png  Sorted view preview
