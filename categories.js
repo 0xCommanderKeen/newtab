@@ -93,7 +93,8 @@ const CATEGORIES = [
       'grep.app', 'explainshell.com', 'man7.org', 'tldr.sh', 'dev.to',
       'hashnode.com', 'freecodecamp.org', 'leetcode.com', 'hackerrank.com',
       'exercism.org', 'codewars.com', 'readthedocs.io', 'gitbook.com',
-      'n8n.io', 'jetbrains.com', 'code.visualstudio.com',
+      'n8n.io', 'jetbrains.com', 'code.visualstudio.com', 'sentry.io',
+      'grafana.com', 'localhost', '127.0.0.1',
     ],
     keywords: [
       'github', 'gitlab', 'repository', 'repositories', 'repo', 'commit',
@@ -223,6 +224,19 @@ const CATEGORIES = [
     ],
   },
   {
+    id: 'games',
+    label: 'Games',
+    domainWeight: 10,
+    keywordWeight: 0,
+    domains: [
+      'boardgamegeek.com', 'chess.com', 'lichess.org',
+      'store.steampowered.com', 'steamcommunity.com', 'gog.com', 'itch.io',
+      'epicgames.com', 'howlongtobeat.com', 'retroachievements.org',
+      'minecraft.net', 'minecraft.wiki',
+    ],
+    keywords: [],
+  },
+  {
     id: 'finance',
     label: 'Finance',
     domainWeight: 10,
@@ -257,6 +271,22 @@ const CATEGORIES = [
     ],
   },
   {
+    id: 'crypto',
+    label: 'Crypto & DeFi',
+    domainWeight: 10,
+    keywordWeight: 0,
+    domains: [
+      'etherscan.io', 'arbiscan.io', 'basescan.org', 'polygonscan.com',
+      'blockscout.com', 'solscan.io', 'debank.com', 'zapper.xyz',
+      'defillama.com', 'dune.com', 'l2beat.com', 'tokenterminal.com',
+      'coingecko.com', 'coinmarketcap.com', 'dexscreener.com', 'uniswap.org',
+      'aave.com', 'curve.fi', 'lido.fi', 'sky.money', 'makerdao.com',
+      'safe.global', 'tenderly.co', 'snapshot.org', 'tally.xyz',
+      'revoke.cash', 'opensea.io', 'ens.domains', 'metamask.io', 'rabby.io',
+    ],
+    keywords: [],
+  },
+  {
     id: 'learning',
     label: 'Learning',
     domainWeight: 4,
@@ -285,6 +315,18 @@ const CATEGORIES = [
       'biology', 'geography', 'literature', 'philosophy', 'psychology',
       'economics',
     ],
+  },
+  {
+    id: 'making',
+    label: 'Making',
+    domainWeight: 10,
+    keywordWeight: 0,
+    domains: [
+      'printables.com', 'thingiverse.com', 'makerworld.com', 'thangs.com',
+      'cults3d.com', 'myminifactory.com', 'prusa3d.com', 'bambulab.com',
+      'creality.com', 'anycubic.com', 'instructables.com',
+    ],
+    keywords: [],
   },
   {
     id: 'travel',
@@ -349,11 +391,22 @@ const CATEGORIES = [
     ],
   },
   {
-    id: 'network',
-    label: 'Network',
+    id: 'homelab',
+    label: 'Homelab',
     domainWeight: 10,
     keywordWeight: 0,
-    domains: ['ts.net', 'tailscale.com'],
+    domains: [
+      'ts.net', 'tailscale.com', 'unifi.ui.com', 'nabu.casa', 'quickconnect.to',
+      'synology.me', 'home-assistant.io', 'jellyfin.org', 'linuxserver.io',
+      'selfh.st', 'proxmox.com', 'truenas.com', 'unraid.net', 'local', 'lan',
+      'home.arpa', 'internal',
+    ],
+    hostPatterns: [
+      /^10\.\d{1,3}\.\d{1,3}\.\d{1,3}$/,
+      /^192\.168\.\d{1,3}\.\d{1,3}$/,
+      /^172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}$/,
+      /^[a-z0-9-]+$/,
+    ],
     keywords: [],
   },
   {
@@ -422,6 +475,16 @@ function findDomainCategory(hostname) {
   return best?.category ?? null;
 }
 
+// Private IPv4 ranges and dotless intranet names like `nas` or `router` have no
+// domain suffix to list, so they match by pattern, and only for web URLs:
+// extension IDs and `about:` pages would otherwise look like dotless names.
+function findHostPatternCategory(url, hostname) {
+  if (!/^https?:/i.test(url || '')) return null;
+  return CATEGORIES.find(
+    (category) => category.hostPatterns?.some((pattern) => pattern.test(hostname)),
+  ) ?? null;
+}
+
 function countMatches(text, pattern) {
   if (!text) return 0;
   return (text.match(pattern) || []).length;
@@ -433,7 +496,8 @@ export function categorizeTab(tab) {
   const path = pathOf(tab.url);
   const scores = new Map();
 
-  const domainCategory = findDomainCategory(hostname);
+  const domainCategory = findDomainCategory(hostname) ??
+    findHostPatternCategory(tab.url, hostname);
   if (domainCategory) {
     scores.set(domainCategory.id, domainCategory.domainWeight);
   }
