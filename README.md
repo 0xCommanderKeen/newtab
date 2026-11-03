@@ -64,6 +64,12 @@ The package is written to `web-ext-artifacts/`.
 - A **Sorted** view that groups all tabs across windows by category: AI,
   Shopping, Development, Work, News & Reading, Social, Media, Games, Finance,
   Crypto & DeFi, Learning, Making, Travel, Health, Homelab, and Other.
+- Custom groups: your own Sorted view categories, defined by domains and
+  optional keywords. They are listed before the built-in categories, in your
+  order and with your color. The ⋯ button on a tab puts its site in a group,
+  creates a new group for it, or takes it out of its group. The **Groups**
+  button opens a panel to rename, recolor, reorder, and delete groups and edit
+  their domains and keywords. Custom groups apply to open and archived tabs.
 - Tab groups shown with their Chrome title and color.
 - Shows how long ago each tab was opened, with the exact time in the tooltip.
 - Pinned, audible, muted, and sleeping (discarded) tabs are marked.
@@ -85,13 +91,33 @@ The package is written to `web-ext-artifacts/`.
 - Click an archived tab to reopen it, or remove it with the × button.
   **Restore** reopens a whole batch, one window per archived window, with its
   tab groups. In Firefox the restored tabs stay unloaded until you open them.
-- **Export** downloads the archive as a JSON backup file. **Import** adds the
-  batches from a backup and skips batches that are already in the archive.
+- **Export** downloads the archive and your custom groups as a JSON backup
+  file. **Import** adds the batches and groups from a backup and skips batches
+  and groups that are already there. A group you already have is kept as it
+  is, not overwritten. Backups made before custom groups existed still import.
 - Automatic light and dark theme.
 
 ## How the sorted view categorizes tabs
 
-Categories are decided locally from the tab's hostname and title/URL keywords.
+Custom groups are checked first, in this order:
+
+1. Domains. The custom group with the most specific matching domain entry
+   wins. An entry with a path beats a bare hostname, and a longer entry beats
+   a shorter one. A hostname such as `example.com` also matches its
+   subdomains, like `docs.example.com`. An entry with a path, such as
+   `github.com/your-org`, matches that host when the address path is
+   `/your-org` or starts with `/your-org/`.
+2. Keywords. Otherwise, the first custom group in your order with a keyword
+   in the tab title or address path wins. Keywords match whole words, so
+   `budget` does not match `budgeting`.
+3. Otherwise the built-in categories decide.
+
+Domain entries are cleaned when you save them: letters are lowercased, and
+`https://`, `www.`, and a trailing `/` are removed. Duplicate and empty lines
+are dropped.
+
+The built-in categories are decided locally from the tab's hostname and
+title/URL keywords.
 Known domains carry more weight than keywords, and topic keywords can override
 generic news or social domains. For example:
 
@@ -121,14 +147,16 @@ The rules live in `categories.js`, so you can add domains or keywords there.
   it with a warning, and the page uses the `data:` favicon Firefox already
   provides for each tab, so Firefox makes no favicon requests to websites either.
 - `storage` — keep tab open timestamps in session storage, and the tab archive
-  in the extension's local storage. Session data is cleared when the browser
+  and custom groups in the extension's local storage. Session data is cleared when the browser
   exits. Neither leaves the machine.
 - `unlimitedStorage` — let the archive grow past Chrome's 10 MB local storage
   quota. Archived favicons are stored as image data.
 
-The archive lives in the extension's local storage. It survives browser
-restarts, and it is not synced. Removing the extension deletes the archive, so
-use **Export** to keep a backup file before you uninstall or reinstall it.
+The archive and custom groups live in the extension's local storage. Archive
+batches are stored under `archive:batch:<id>` keys, and custom groups as one
+ordered array under `customGroups`. Both survive browser restarts, and neither
+is synced. Removing the extension deletes them, so use **Export** to keep a
+backup file before you uninstall or reinstall it.
 
 The background service worker records tab open times and removes them when tabs
 close. There are no analytics, no external requests, and no host permissions. The
@@ -148,8 +176,9 @@ is visible.
   open before the extension was installed or before the browser restarted. Those
   tabs show "Before tracking". New tabs are tracked precisely from the moment
   they open.
-- Categorization is a heuristic, so a page can land in the wrong category. Edit
-  `categories.js` to tune the domain and keyword rules.
+- Categorization is a heuristic, so a page can land in the wrong category. Put
+  its site in a custom group, or edit `categories.js` to tune the built-in
+  domain and keyword rules.
 - A browser restart restores the tab group state from Chrome's session; the
   overview's local group-collapse choices are stored in `localStorage`.
 - Firefox 140 or newer is required. Tab groups use Firefox's tab groups feature,
@@ -166,7 +195,8 @@ is visible.
 ```
 manifest.json     Manifest V3 definition for Chrome and Firefox, new tab override, and background worker
 background.js     Records tab open times and cleans them up
-categories.js     Domain and keyword rules for the sorted view
+categories.js     Domain and keyword rules for the sorted view, and custom group matching
+custom-groups.js  Custom group storage, validation, and edits
 newtab.html       Page shell
 newtab.css        Light/dark responsive styling
 newtab.js         Data loading, rendering, search, views, and tab actions
