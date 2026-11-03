@@ -491,14 +491,16 @@ export async function exportArchive() {
     .filter(Boolean)
     .sort((a, b) => b.archivedAt - a.archivedAt);
   const customGroups = await loadGroups();
-  return { format: BACKUP_FORMAT, version: BACKUP_VERSION, exportedAt: Date.now(), archive, customGroups };
+  const suspended = await loadSuspended();
+  return { format: BACKUP_FORMAT, version: BACKUP_VERSION, exportedAt: Date.now(), archive, customGroups, suspended };
 }
 
 /**
- * Adds the batches and custom groups from a backup file. A batch or group
- * whose id is already present is skipped, and a batch without an id gets one
- * derived from its content, so importing the same file twice changes nothing.
- * Backups written before custom groups existed have no customGroups field.
+ * Adds the batches, custom groups, and suspended tabs from a backup file. One
+ * whose id is already present is skipped, and a batch or suspended tab without
+ * an id gets one derived from its content, so importing the same file twice
+ * changes nothing. customGroups and suspended are optional, because backups
+ * written before those existed have no such field.
  */
 export async function importArchive(text) {
   let data;
@@ -515,10 +517,10 @@ export async function importArchive(text) {
   }
 
   const stored = await chrome.storage.local.get(null);
-  const taken = new Set(Object.keys(stored).filter(isBatchKey));
+  const taken = new Set(Object.keys(stored).filter((key) => isBatchKey(key) || isSuspendedKey(key)));
   const fallbackArchivedAt = Number.isFinite(data.exportedAt) ? data.exportedAt : Date.now();
   const additions = {};
-  const result = { batches: 0, tabs: 0, skipped: 0, invalid: 0, groups: 0, groupsSkipped: 0 };
+  const result = { batches: 0, tabs: 0, skipped: 0, invalid: 0, groups: 0, groupsSkipped: 0, suspended: 0 };
 
   for (const raw of data.archive) {
     const id = validId(raw?.id) ? raw.id : contentId(raw);
@@ -537,7 +539,17 @@ export async function importArchive(text) {
     result.tabs += countTabs(batch);
   }
 
-  if (result.batches > 0) await chrome.storage.local.set(additions);
+  for (const raw of arrayOf(data.suspended)) {
+    const id = validId(raw?.id) ? raw.id : contentId(raw);
+    if (taken.has(suspendedKey(id))) continue;
+    const entry = normalizeSuspended(raw, id, fallbackArchivedAt);
+    if (!entry) continue;
+    taken.add(suspendedKey(id));
+    additions[suspendedKey(id)] = entry;
+    result.suspended += 1;
+  }
+
+  if (Object.keys(additions).length > 0) await chrome.storage.local.set(additions);
   const { added, skipped, invalid } = await mergeGroups(data.customGroups);
   result.groups = added;
   result.groupsSkipped = skipped;

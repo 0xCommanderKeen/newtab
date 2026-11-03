@@ -806,7 +806,8 @@ function renderControls() {
   els.groupsAdd.disabled = busy;
   els.archiveExport.hidden = state.source !== 'archive';
   els.archiveImport.hidden = state.source !== 'archive';
-  els.archiveExport.disabled = busy || (archived === 0 && state.customGroups.length === 0);
+  const suspended = state.windows.reduce((sum, win) => sum + win.tabs.filter(isSuspended).length, 0);
+  els.archiveExport.disabled = busy || (archived === 0 && state.customGroups.length === 0 && suspended === 0);
   els.archiveImport.disabled = busy;
 
   els.footerHint.textContent = state.source === 'archive'
@@ -1884,7 +1885,7 @@ async function importArchiveFile(file) {
   if (isBusy()) return;
   let result;
   try {
-    const { batches, tabs, skipped, invalid, groups, groupsSkipped, groupsInvalid } =
+    const { batches, tabs, skipped, invalid, groups, groupsSkipped, groupsInvalid, suspended } =
       await importArchive(await file.text());
     const notes = [];
     if (skipped > 0) notes.push(`${plural(skipped, 'batch', 'batches')} already in the archive were skipped.`);
@@ -1893,7 +1894,12 @@ async function importArchiveFile(file) {
     if (groupsInvalid > 0) notes.push(`${plural(groupsInvalid, 'group')} without a valid id ${groupsInvalid === 1 ? 'was' : 'were'} left out.`);
     result = {
       kind: 'result',
-      text: `Imported ${plural(batches, 'batch', 'batches')}, ${plural(tabs, 'tab')}, ${plural(groups, 'group')}`,
+      text: [
+        `Imported ${plural(batches, 'batch', 'batches')}`,
+        plural(tabs, 'tab'),
+        plural(groups, 'group'),
+        ...(suspended > 0 ? [plural(suspended, 'suspended tab')] : []),
+      ].join(', '),
       detail: notes.join(' '),
       tone: '',
     };
@@ -1901,7 +1907,7 @@ async function importArchiveFile(file) {
     result = { kind: 'result', text: 'Nothing was imported', detail: error?.message || '', tone: 'error' };
   }
   state.prompt = result;
-  await refresh(['archive', 'groups']);
+  await refresh(['archive', 'groups', 'open']);
 }
 
 /* ----------------------------------------------------------- custom groups */
