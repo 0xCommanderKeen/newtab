@@ -60,16 +60,25 @@ The package is written to `web-ext-artifacts/`.
 
 ## Features
 
+- The top bar switches between **Open tabs** and the **Archive**, each with
+  its tab count, and holds the search box. Below it, a toolbar holds the view
+  switch (Windows, called Batches in the archive, and Sorted), a summary of
+  what is shown, and the actions for the current page and view: **Archive all** for open tabs, **Export** and
+  **Import** in the archive, and **New group** in the Sorted view.
 - Every window, with the current window first.
 - A **Sorted** view that groups all tabs across windows by category: AI,
   Shopping, Development, Work, News & Reading, Social, Media, Games, Finance,
   Crypto & DeFi, Learning, Making, Travel, Health, Homelab, and Other.
 - Custom groups: your own Sorted view categories, defined by domains and
   optional keywords. They are listed before the built-in categories, in your
-  order and with your color. The ⋯ button on a tab puts its site in a group,
-  creates a new group for it, or takes it out of its group. The **Groups**
-  button opens a panel to rename, recolor, reorder, and delete groups and edit
-  their domains and keywords. Custom groups apply to open and archived tabs.
+  order and with your color, and a group with no tabs yet still gets a
+  section. The ⋯ button on a tab puts its site in a group, creates a new group
+  for it, or takes it out of its group. The pencil button on a custom group's
+  section opens its editor in place, to rename, recolor, reorder, and delete
+  the group and edit its domains and keywords. Changes are saved as you make
+  them; **Done** or Escape closes the editor. **New group** in the Sorted
+  toolbar adds a group and opens its editor. Custom groups apply to open and
+  archived tabs.
 - Tab groups shown with their Chrome title and color.
 - Shows how long ago each tab was opened, with the exact time in the tooltip.
 - Pinned, audible, muted, and sleeping (discarded) tabs are marked.
@@ -97,8 +106,8 @@ The package is written to `web-ext-artifacts/`.
 - Click an archived tab to reopen it, or remove it with the × button.
   **Restore** reopens a whole batch, one window per archived window, with its
   tab groups. In Firefox the restored tabs stay unloaded until you open them.
-- **Export** downloads the archive and your custom groups as a JSON backup
-  file. **Import** adds the batches and groups from a backup and skips batches
+- **Export**, in the archive toolbar, downloads the archive and your custom
+  groups as a JSON backup file. **Import** adds the batches and groups from a backup and skips batches
   and groups that are already there. A group you already have is kept as it
   is, not overwritten. Backups made before custom groups existed still import.
 - Automatic light and dark theme.
@@ -122,7 +131,7 @@ Domain entries are cleaned when you save them: letters are lowercased, and
 `https://`, `www.`, and a trailing `/` are removed. Duplicate and empty lines
 are dropped. Ports are ignored, so `localhost` covers every local port. A
 domain belongs to one group: adding it to a group, from the ⋯ menu or the
-panel, takes it out of any other group.
+group's editor, takes it out of any other group.
 
 The built-in categories are decided locally from the tab's hostname and
 title/URL keywords.
