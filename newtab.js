@@ -1680,10 +1680,10 @@ async function suspendScope(scope, returnFocus = '') {
   render();
 
   let result = null;
-  let focus = [returnFocus, returnFocus.replace(/-suspend$/, '-reopen')];
+  const focus = [returnFocus];
   try {
     const { suspended, leftOpen } = await suspendTabs(tabs, state.windows.flatMap((win) => win.groups));
-    if (scope.kind === 'tab' && suspended.length === 1) focus = [`[data-tab-id="${CSS.escape(suspended[0])}"] .tab-main`];
+    if (suspended.length > 0) focus.push(cardFocus(suspended[0]));
     if (leftOpen > 0) {
       result = {
         kind: 'result',
@@ -1698,7 +1698,7 @@ async function suspendScope(scope, returnFocus = '') {
   }
 
   state.prompt = result;
-  await refresh(['open']);
+  await refresh();
   focusFirst([...(result ? ['#banner-dismiss'] : []), ...focus.filter(Boolean), '#search']);
 }
 
@@ -1710,12 +1710,14 @@ async function reopenScope(scope, returnFocus = '') {
   render();
 
   let result = null;
+  const focus = [returnFocus];
   try {
-    const { reopened, failed } = await reopenSuspended(tabs);
+    const { opened, failed } = await reopenSuspended(tabs);
+    if (opened.length > 0) focus.push(cardFocus(opened[0]));
     if (failed > 0) {
       result = {
         kind: 'result',
-        text: `Reopened ${plural(reopened, 'tab')}`,
+        text: `Reopened ${plural(opened.length, 'tab')}`,
         detail: `${plural(failed, 'tab')} could not be opened and ${failed === 1 ? 'stays' : 'stay'} suspended.`,
         tone: 'warn',
       };
@@ -1726,14 +1728,17 @@ async function reopenScope(scope, returnFocus = '') {
   }
 
   state.prompt = result;
-  await refresh(['open']);
-  focusFirst([...(result ? ['#banner-dismiss'] : []), ...(returnFocus ? [returnFocus.replace(/-reopen$/, '-suspend')] : []), '#search']);
+  await refresh();
+  focusFirst([...(result ? ['#banner-dismiss'] : []), ...focus.filter(Boolean), '#search']);
 }
 
 async function reopenTab(tab) {
   if (isBusy()) return;
   try {
-    await reopenSuspended([tab], { activate: true });
+    const { failed } = await reopenSuspended([tab], { activate: true });
+    if (failed > 0) {
+      state.prompt = { kind: 'result', text: 'Could not reopen the tab', detail: 'It stays suspended.', tone: 'warn' };
+    }
   } catch (error) {
     console.warn('Tab Overview: could not reopen suspended tab', error);
   }
@@ -1749,6 +1754,8 @@ async function forgetTab(tab) {
   }
   scheduleRefresh('open');
 }
+
+const cardFocus = (tabId) => `[data-tab-id="${CSS.escape(String(tabId))}"] .tab-main`;
 
 function promptArchive(scope = ALL_TABS, returnFocus = '') {
   if (isBusy()) return;

@@ -138,15 +138,19 @@ export async function suspendTabs(tabs, groups) {
   const keyFor = (tabId) => suspendedKey(entries.get(tabId).id);
   const keys = [...entries.keys()].map(keyFor);
   await chrome.storage.local.set(Object.fromEntries([...entries.values()].map((entry) => [suspendedKey(entry.id), entry])));
-  const written = await chrome.storage.local.get(keys);
-  const complete = [...entries.values()]
-    .every((entry) => normalizeSuspended(written[suspendedKey(entry.id)], entry.id)?.url === entry.url);
-  if (!complete) {
+  let open;
+  try {
+    const written = await chrome.storage.local.get(keys);
+    const complete = [...entries.values()]
+      .every((entry) => normalizeSuspended(written[suspendedKey(entry.id)], entry.id)?.url === entry.url);
+    if (!complete) throw new Error('The suspended tabs could not be saved, so no tab was closed.');
+    open = await chrome.tabs.query({});
+  } catch (error) {
     await chrome.storage.local.remove(keys);
-    throw new Error('The suspended tabs could not be saved, so no tab was closed.');
+    throw error;
   }
 
-  const unchanged = (await chrome.tabs.query({}))
+  const unchanged = open
     .filter((tab) => entries.get(tab.id)?.url === urlOf(tab))
     .map((tab) => tab.id);
   const stillOpen = new Set(await closeTabs(unchanged));
@@ -203,5 +207,5 @@ export async function reopenSuspended(tabs, { activate = false } = {}) {
     await regroup({ groups: [...groups.values()] }, created, windowId);
   }
   if (activate && focusWindowId !== null) await chrome.windows.update(focusWindowId, { focused: true });
-  return { reopened: created.size, failed };
+  return { opened: [...created.values()], failed };
 }

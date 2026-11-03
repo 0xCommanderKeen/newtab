@@ -139,14 +139,16 @@ export async function archivePlan(plan, label = '') {
   }
 
   const planned = plan.windows.flatMap((win) => [...win.groups.flatMap(({ tabs }) => tabs), ...win.ungrouped]);
-  await forgetSuspended(planned.filter((tab) => tab.suspended).map((tab) => tab.id));
+  const suspendedIds = planned.filter((tab) => tab.suspended).map((tab) => tab.id);
+  // The batch is safe by now, so a key that stays is a leftover, not a failed archive.
+  const stillSuspended = await forgetSuspended(suspendedIds).then(() => 0, () => suspendedIds.length);
 
   const savedUrls = new Map(planned.filter((tab) => !tab.suspended).map((tab) => [tab.id, urlOf(tab)]));
   const unchanged = (await chrome.tabs.query({}))
     .filter((tab) => savedUrls.get(tab.id) === urlOf(tab))
     .map((tab) => tab.id);
 
-  const closeFailed = savedUrls.size - unchanged.length + (await closeTabs(unchanged)).length;
+  const closeFailed = stillSuspended + savedUrls.size - unchanged.length + (await closeTabs(unchanged)).length;
   return { archived: plan.count, closeFailed, batchId: batch.id };
 }
 
