@@ -898,6 +898,12 @@ textarea {
   outline-offset: -1px;
 }
 
+/* A group without tabs has no archive button; keep its pencil in line with
+   the pencils that have one beside them. */
+.overview:has(.section-archive) .section-edit:last-child {
+  margin-right: 32px;
+}
+
 .group-header-row:hover .section-archive,
 .group-header-row:focus-within .section-archive,
 .window-head:hover .section-archive,
