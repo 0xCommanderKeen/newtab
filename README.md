@@ -74,8 +74,9 @@ The package is written to `web-ext-artifacts/`.
   Crypto & DeFi, Learning, Making, Travel, Health, Homelab, and Other.
 - Custom groups: your own Sorted view categories, defined by domains and
   optional keywords. They are listed before the built-in categories, in your
-  order and with your color. A group with no tabs yet still gets a section,
-  except while you search. The ⋯ button on a tab puts its site in a group,
+  order and with your color. A group with no tabs is hidden. **Show N empty
+  groups** in the Sorted toolbar lists every custom group, and the choice is
+  remembered. The group whose editor is open always shows. The ⋯ button on a tab puts its site in a group,
   creates a new group for it, or takes it out of its group. The pencil button
   on a custom group's section opens its editor in place, to rename, recolor,
   reorder, and delete the group and edit its domains and keywords. Color and
