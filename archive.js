@@ -18,6 +18,12 @@ import { GROUP_COLORS, loadGroups, mergeGroups } from './custom-groups.js';
 //               tabs = every tab of the window, groups first, then ungrouped
 // ArchiveGroup  { id, title, color, tabs }
 // ArchivedTab   { id, batchId, title, url, favIconUrl, groupId, archivedAt }
+//
+// A suspended tab is closed in the browser but still listed with the open
+// tabs. Each one has its own key, for the same reason as a batch:
+// Suspended     { id, url, title, favIconUrl?, suspendedAt, windowId, index,
+//                 group: { title, color } | null }
+//               windowId, index, and group describe where the tab was open
 
 const BATCH_PREFIX = 'archive:batch:';
 const BACKUP_FORMAT = 'tab-overview-backup';
@@ -25,16 +31,22 @@ const BACKUP_VERSION = 1;
 const MAX_ID_LENGTH = 200;
 const MAX_LABEL_LENGTH = 120;
 
+const SUSPENDED_PREFIX = 'suspended:';
+
 export const isBatchKey = (key) => key.startsWith(BATCH_PREFIX);
+export const isSuspendedKey = (key) => key.startsWith(SUSPENDED_PREFIX);
+export const suspendedKey = (id) => SUSPENDED_PREFIX + id;
 const keyOf = (batchId) => BATCH_PREFIX + batchId;
 // While Chrome navigates, url is still the old page and pendingUrl the new one.
-const urlOf = (tab) => (isReopenable(tab.pendingUrl) ? tab.pendingUrl : tab.url || tab.pendingUrl || '');
+export const urlOf = (tab) => (isReopenable(tab.pendingUrl) ? tab.pendingUrl : tab.url || tab.pendingUrl || '');
 
-// Every overview page shares the extension's origin, so a Web Lock per batch
-// serializes read-modify-write on that batch across pages.
-function withBatchLock(batchId, task) {
-  return globalThis.navigator?.locks ? navigator.locks.request(keyOf(batchId), task) : task();
+// Every overview page shares the extension's origin, so a Web Lock per storage
+// key serializes read-modify-write on that key across pages.
+export function withKeyLock(key, task) {
+  return globalThis.navigator?.locks ? navigator.locks.request(key, task) : task();
 }
+
+const withBatchLock = (batchId, task) => withKeyLock(keyOf(batchId), task);
 
 /* -------------------------------------------------------------- planning */
 
@@ -88,7 +100,9 @@ export function planArchive(windows) {
 /**
  * Writes the whole batch, reads it back, and only then closes the tabs. If
  * the write fails no tab is closed. A tab that navigated since it was read is
- * left open, because the archive holds its old address.
+ * left open, because the archive holds its old address. A suspended tab in
+ * the plan has no browser tab; once the batch is saved it stops being
+ * suspended.
  */
 export async function archivePlan(plan, label = '') {
   if (plan.count === 0) return { archived: 0, closeFailed: 0, batchId: null };
@@ -124,29 +138,32 @@ export async function archivePlan(plan, label = '') {
     throw new Error('The archive could not be saved completely, so no tab was closed.');
   }
 
-  const savedUrls = new Map(plan.windows.flatMap((win) => [
-    ...win.groups.flatMap(({ tabs }) => tabs),
-    ...win.ungrouped,
-  ]).map((tab) => [tab.id, urlOf(tab)]));
+  const planned = plan.windows.flatMap((win) => [...win.groups.flatMap(({ tabs }) => tabs), ...win.ungrouped]);
+  const suspendedIds = planned.filter((tab) => tab.suspended).map((tab) => tab.id);
+  // The batch is safe by now, so a key that stays is a leftover, not a failed archive.
+  const stillSuspended = await forgetSuspended(suspendedIds).then(() => 0, () => suspendedIds.length);
+
+  const savedUrls = new Map(planned.filter((tab) => !tab.suspended).map((tab) => [tab.id, urlOf(tab)]));
   const unchanged = (await chrome.tabs.query({}))
     .filter((tab) => savedUrls.get(tab.id) === urlOf(tab))
     .map((tab) => tab.id);
 
-  const closeFailed = savedUrls.size - unchanged.length + await closeTabs(unchanged);
+  const closeFailed = stillSuspended + savedUrls.size - unchanged.length + (await closeTabs(unchanged)).length;
   return { archived: plan.count, closeFailed, batchId: batch.id };
 }
 
-async function closeTabs(ids) {
-  if (ids.length === 0) return 0;
+// Resolves with the ids that are still open.
+export async function closeTabs(ids) {
+  if (ids.length === 0) return [];
   try {
     await chrome.tabs.remove(ids);
-    return 0;
+    return [];
   } catch {
-    // One stale id fails the whole call, so retry one by one and count what
+    // One stale id fails the whole call, so retry one by one and keep what
     // is genuinely still open.
     await Promise.allSettled(ids.map((id) => chrome.tabs.remove(id)));
     const open = new Set((await chrome.tabs.query({})).map((tab) => tab.id));
-    return ids.filter((id) => open.has(id)).length;
+    return ids.filter((id) => open.has(id));
   }
 }
 
@@ -267,6 +284,23 @@ function normalizeTabs(raw, idBase, idFor) {
     .filter(Boolean);
 }
 
+export function normalizeSuspended(raw, id, fallbackSuspendedAt = 0) {
+  if (!isObject(raw) || !isReopenable(raw.url)) return null;
+  const entry = {
+    id,
+    url: raw.url,
+    title: stringOr(raw.title, '') || raw.url,
+    suspendedAt: Number.isFinite(raw.suspendedAt) ? raw.suspendedAt : fallbackSuspendedAt,
+    windowId: Number.isInteger(raw.windowId) ? raw.windowId : null,
+    index: Number.isInteger(raw.index) && raw.index >= 0 ? raw.index : 0,
+    group: isObject(raw.group)
+      ? { title: stringOr(raw.group.title, ''), color: GROUP_COLORS.has(raw.group.color) ? raw.group.color : 'grey' }
+      : null,
+  };
+  if (typeof raw.favIconUrl === 'string' && /^data:/i.test(raw.favIconUrl)) entry.favIconUrl = raw.favIconUrl;
+  return entry;
+}
+
 function contentId(value) {
   const text = JSON.stringify(value) ?? '';
   let a = 0x811c9dc5;
@@ -348,21 +382,7 @@ async function restoreLocked(batchId) {
   const restored = [];
   let failed = 0;
   let windows = 0;
-  let discardedSupported = true;
-
-  // Firefox can create tabs unloaded; Chrome rejects the property. Only when
-  // the plain create then succeeds is the property known to be the problem.
-  const createBackgroundTab = async (windowId, tab) => {
-    const plain = { windowId, url: tab.url, active: false };
-    if (!discardedSupported) return chrome.tabs.create(plain);
-    try {
-      return await chrome.tabs.create({ ...plain, discarded: true, title: tab.title });
-    } catch {
-      const created = await chrome.tabs.create(plain);
-      discardedSupported = false;
-      return created;
-    }
-  };
+  const createBackgroundTab = backgroundTabCreator();
 
   for (const win of batch.windows) {
     let windowId = null;
@@ -392,19 +412,69 @@ async function restoreLocked(batchId) {
   return { restored: restored.length, failed, windows };
 }
 
-async function regroup(win, created, windowId) {
+/**
+ * Returns a function that opens a tab in the background, unloaded where the
+ * browser allows it. windowId null opens it in the current window.
+ */
+export function backgroundTabCreator() {
+  let discardedSupported = true;
+
+  // Firefox can create tabs unloaded; Chrome rejects the property. Only when
+  // the plain create then succeeds is the property known to be the problem.
+  return async (windowId, tab) => {
+    const plain = { ...(windowId === null ? {} : { windowId }), url: tab.url, active: false };
+    if (!discardedSupported) return chrome.tabs.create(plain);
+    try {
+      return await chrome.tabs.create({ ...plain, discarded: true, title: tab.title });
+    } catch {
+      const created = await chrome.tabs.create(plain);
+      discardedSupported = false;
+      return created;
+    }
+  };
+}
+
+/**
+ * Puts the created tabs of each group into a tab group in windowId: the open
+ * group with the same title and color if there is one, otherwise a new one.
+ * created maps a stored tab id to the id of the tab opened for it.
+ */
+export async function regroup(win, created, windowId) {
   if (!chrome.tabs.group) return;
+  const open = await chrome.tabGroups?.query?.({ windowId }).catch(() => []) ?? [];
 
   for (const group of win.groups) {
     const tabIds = group.tabs.map((tab) => created.get(tab.id)).filter((id) => typeof id === 'number');
     if (tabIds.length === 0) continue;
     try {
+      const existing = open.find((candidate) => sameGroup(candidate, group));
+      if (existing) {
+        await chrome.tabs.group({ tabIds, groupId: existing.id });
+        continue;
+      }
       const groupId = await chrome.tabs.group({ tabIds, createProperties: { windowId } });
       await chrome.tabGroups?.update?.(groupId, { title: group.title, color: group.color });
     } catch (error) {
       console.warn('Tab Overview: could not recreate tab group', group.title, error);
     }
   }
+}
+
+// Group ids change when a group is recreated or the browser restarts, so a
+// group is recognized by what the user sees.
+export const sameGroup = (a, b) => (a.title || '') === (b.title || '') && a.color === b.color;
+
+export async function loadSuspended() {
+  const stored = await chrome.storage.local.get(null);
+  return Object.entries(stored)
+    .filter(([key]) => isSuspendedKey(key))
+    .map(([key, raw]) => normalizeSuspended(raw, key.slice(SUSPENDED_PREFIX.length)))
+    .filter(Boolean)
+    .sort((a, b) => a.suspendedAt - b.suspendedAt);
+}
+
+export function forgetSuspended(ids) {
+  return Promise.all(ids.map((id) => withKeyLock(suspendedKey(id), () => chrome.storage.local.remove(suspendedKey(id)))));
 }
 
 export function deleteBatch(batchId) {
@@ -421,14 +491,16 @@ export async function exportArchive() {
     .filter(Boolean)
     .sort((a, b) => b.archivedAt - a.archivedAt);
   const customGroups = await loadGroups();
-  return { format: BACKUP_FORMAT, version: BACKUP_VERSION, exportedAt: Date.now(), archive, customGroups };
+  const suspended = await loadSuspended();
+  return { format: BACKUP_FORMAT, version: BACKUP_VERSION, exportedAt: Date.now(), archive, customGroups, suspended };
 }
 
 /**
- * Adds the batches and custom groups from a backup file. A batch or group
- * whose id is already present is skipped, and a batch without an id gets one
- * derived from its content, so importing the same file twice changes nothing.
- * Backups written before custom groups existed have no customGroups field.
+ * Adds the batches, custom groups, and suspended tabs from a backup file. One
+ * whose id is already present is skipped, and a batch or suspended tab without
+ * an id gets one derived from its content, so importing the same file twice
+ * changes nothing. customGroups and suspended are optional, because backups
+ * written before those existed have no such field.
  */
 export async function importArchive(text) {
   let data;
@@ -445,10 +517,10 @@ export async function importArchive(text) {
   }
 
   const stored = await chrome.storage.local.get(null);
-  const taken = new Set(Object.keys(stored).filter(isBatchKey));
+  const taken = new Set(Object.keys(stored).filter((key) => isBatchKey(key) || isSuspendedKey(key)));
   const fallbackArchivedAt = Number.isFinite(data.exportedAt) ? data.exportedAt : Date.now();
   const additions = {};
-  const result = { batches: 0, tabs: 0, skipped: 0, invalid: 0, groups: 0, groupsSkipped: 0 };
+  const result = { batches: 0, tabs: 0, skipped: 0, invalid: 0, groups: 0, groupsSkipped: 0, suspended: 0 };
 
   for (const raw of data.archive) {
     const id = validId(raw?.id) ? raw.id : contentId(raw);
@@ -467,7 +539,18 @@ export async function importArchive(text) {
     result.tabs += countTabs(batch);
   }
 
-  if (result.batches > 0) await chrome.storage.local.set(additions);
+  for (const raw of arrayOf(data.suspended)) {
+    const id = validId(raw?.id) ? raw.id : contentId(raw);
+    if (taken.has(suspendedKey(id))) continue;
+    const entry = normalizeSuspended(raw, id, fallbackArchivedAt);
+    if (!entry) continue;
+    taken.add(suspendedKey(id));
+    // A window id from another browser session names no window here.
+    additions[suspendedKey(id)] = { ...entry, windowId: null };
+    result.suspended += 1;
+  }
+
+  if (Object.keys(additions).length > 0) await chrome.storage.local.set(additions);
   const { added, skipped, invalid } = await mergeGroups(data.customGroups);
   result.groups = added;
   result.groupsSkipped = skipped;

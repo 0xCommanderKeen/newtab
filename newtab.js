@@ -18,14 +18,18 @@ import {
   skipReason,
   deleteBatch,
   exportArchive,
+  forgetSuspended,
   importArchive,
   isBatchKey,
+  isSuspendedKey,
   loadArchive,
+  loadSuspended,
   planArchive,
   removeArchivedTabs,
   reopenArchivedTab,
   restoreBatch,
 } from './archive.js';
+import { SUSPENDED_WINDOW_ID, placeSuspended, reopenSuspended, suspendTabs } from './suspend.js';
 
 const SELF_URL = globalThis.chrome?.runtime?.getURL
   ? chrome.runtime.getURL('newtab.html')
@@ -106,6 +110,10 @@ const ICONS = {
     '<svg viewBox="0 0 16 16" fill="none" aria-hidden="true">' +
     '<path d="M10.5 3.5l2 2L6 12l-2.6.6L4 10z" stroke="currentColor" stroke-width="1.5" ' +
     'stroke-linejoin="round"/></svg>',
+  suspend:
+    '<svg viewBox="0 0 24 24" fill="none" aria-hidden="true">' +
+    '<path d="M20 14.5A8.5 8.5 0 1 1 9.5 4a7 7 0 0 0 10.5 10.5Z" stroke="currentColor" ' +
+    'stroke-width="1.7" stroke-linejoin="round"/></svg>',
 };
 
 const SOURCES = {
@@ -114,7 +122,7 @@ const SOURCES = {
     tabNoun: 'tab',
     containerNoun: ['window', 'windows'],
     windows: () => state.windows,
-    containerCount: () => state.windows.length,
+    containerCount: () => state.windows.filter((win) => win.id !== SUSPENDED_WINDOW_ID).length,
     error: () => state.openError,
     errorTitle: 'Couldn’t read your tabs',
     renderWindows: renderWindowView,
@@ -131,6 +139,18 @@ const SOURCES = {
       dismissLabel: 'Close',
       middleClick: closeTab,
       archiveSection: promptArchive,
+      suspendSection: suspendScope,
+      reopenSection: reopenScope,
+    },
+    // A suspended tab is listed with the open tabs but is closed in the browser.
+    suspended: {
+      ageOf: suspendedAge,
+      actions: {
+        activate: reopenTab,
+        activateLabel: 'Reopen',
+        dismiss: forgetTab,
+        dismissLabel: 'Forget suspended tab',
+      },
     },
   },
   archive: {
@@ -171,7 +191,7 @@ const state = {
   source: loadChoice(SOURCE_KEY, SOURCE_NAMES, 'open'),
   view: loadChoice(VIEW_KEY, VIEWS, 'windows'),
   collapsed: {
-    open: loadSet(COLLAPSED_KEY, toNumberId),
+    open: loadSet(COLLAPSED_KEY, (value) => toNumberId(value) ?? toStringId(value)),
     archive: loadSet(ARCHIVE_COLLAPSED_KEY, toStringId),
   },
   collapsedCategories: loadSet(COLLAPSED_CATEGORIES_KEY, toStringId),
@@ -317,9 +337,24 @@ function bindPointerHold() {
   document.addEventListener('pointercancel', release, true);
 }
 
+// Reading suspended tabs reads all of storage, archive included, so it happens
+// once per change and not on every tab event. The version tells a read that
+// began before a change from one that saw it.
+let suspendedVersion = 0;
+let suspendedCache = { version: -1, entries: [] };
+
+async function currentSuspended() {
+  if (!EXTENSION_STORAGE) return [];
+  if (suspendedCache.version === suspendedVersion) return suspendedCache.entries;
+  const version = suspendedVersion;
+  const entries = await loadSuspended();
+  suspendedCache = { version, entries };
+  return entries;
+}
+
 async function loadOpen() {
   try {
-    const [windows, openedAt] = await Promise.all([readOpenWindows(), loadTabTimes()]);
+    const [windows, openedAt] = await Promise.all([readOpenWindows(await currentSuspended()), loadTabTimes()]);
     state.windows = windows;
     state.openedAt = openedAt;
     state.openError = null;
@@ -363,23 +398,26 @@ async function loadCustomGroups() {
   state.groupRules = compileCustomGroups(state.customGroups);
 }
 
-async function readOpenWindows() {
+async function readOpenWindows(suspended) {
   const [windows, groups, selfTab] = await Promise.all([
     chrome.windows.getAll({ populate: true }),
     chrome.tabGroups?.query ? chrome.tabGroups.query({}) : Promise.resolve([]),
     chrome.tabs.getCurrent ? chrome.tabs.getCurrent().catch(() => null) : Promise.resolve(null),
   ]);
 
+  // Placed before the overview's own tab is dropped, so saved indexes line up,
+  // and before empty windows are, so a window left with only the overview
+  // keeps its suspended tabs.
+  const placed = placeSuspended(
+    windows.map((win) => ({ ...win, tabs: [...(win.tabs || [])].sort((a, b) => a.index - b.index) })),
+    groups,
+    suspended,
+  );
   const selfTabId = selfTab?.id ?? null;
-  const groupsById = new Map(groups.map((group) => [group.id, group]));
+  const groupsById = new Map(placed.groups.map((group) => [group.id, group]));
 
-  return windows
-    .map((win) => ({
-      ...win,
-      tabs: (win.tabs || [])
-        .filter((tab) => tab.id !== selfTabId && !isSelfTab(tab))
-        .sort((a, b) => a.index - b.index),
-    }))
+  const open = placed.windows
+    .map((win) => ({ ...win, tabs: win.tabs.filter((tab) => tab.id !== selfTabId && !isSelfTab(tab)) }))
     .filter((win) => win.tabs.length > 0)
     .sort((a, b) => Number(b.focused) - Number(a.focused) || a.id - b.id)
     .map((win, index) => {
@@ -387,7 +425,7 @@ async function readOpenWindows() {
       return {
         id: win.id,
         title,
-        number: index + 1,
+        label: `Window ${index + 1}`,
         focused: win.focused,
         incognito: win.incognito,
         badge: { text: `W${index + 1}`, title },
@@ -395,33 +433,45 @@ async function readOpenWindows() {
         ...groupTabs(win.tabs, groupsById),
       };
     });
+
+  if (placed.orphans.length === 0) return open;
+  const title = 'Suspended from closed windows';
+  return [...open, {
+    id: SUSPENDED_WINDOW_ID,
+    title,
+    label: title,
+    focused: false,
+    incognito: false,
+    badge: { text: 'Closed', title },
+    tabs: placed.orphans,
+    ...groupTabs(placed.orphans, groupsById),
+  }];
 }
 
 function groupTabs(tabs, groupsById) {
   const byGroup = new Map();
   const ungrouped = [];
 
-  for (const tab of tabs) {
+  tabs.forEach((tab, position) => {
     if (tab.groupId === -1 || tab.groupId === undefined) {
       ungrouped.push(tab);
-    } else {
-      if (!byGroup.has(tab.groupId)) byGroup.set(tab.groupId, []);
-      byGroup.get(tab.groupId).push(tab);
+      return;
     }
-  }
+    if (!byGroup.has(tab.groupId)) byGroup.set(tab.groupId, { position, tabs: [] });
+    byGroup.get(tab.groupId).tabs.push(tab);
+  });
 
   const groups = [...byGroup.entries()]
-    .map(([id, groupTabs]) => {
+    .sort(([, a], [, b]) => a.position - b.position)
+    .map(([id, { tabs: groupTabs }]) => {
       const meta = groupsById.get(id);
       return {
         id,
         title: meta?.title || '',
         color: meta?.color || 'grey',
         tabs: groupTabs,
-        firstIndex: Math.min(...groupTabs.map((tab) => tab.index)),
       };
-    })
-    .sort((a, b) => a.firstIndex - b.firstIndex);
+    });
 
   return { groups, ungrouped };
 }
@@ -491,6 +541,10 @@ function bindEvents() {
     }
     if (areaName === 'local' && EXTENSION_STORAGE && keys.some(isBatchKey)) {
       scheduleRefresh('archive');
+    }
+    if (areaName === 'local' && EXTENSION_STORAGE && keys.some(isSuspendedKey)) {
+      suspendedVersion += 1;
+      reload();
     }
     if (areaName === 'local' && EXTENSION_STORAGE && keys.includes(GROUPS_KEY)) {
       scheduleRefresh('groups');
@@ -719,6 +773,7 @@ function renderSource(ctx) {
 
   const windows = ctx.windows();
   const totalTabs = windows.reduce((sum, win) => sum + win.tabs.length, 0);
+  const suspended = windows.reduce((sum, win) => sum + win.tabs.filter(isSuspended).length, 0);
 
   if (totalTabs === 0) {
     mount(createEmptyState(ctx.empty));
@@ -740,7 +795,12 @@ function renderSource(ctx) {
   const [one, many] = ctx.containerNoun;
   els.summary.textContent = ctx.query
     ? matchSummary(matched, totalTabs, ctx.tabNoun)
-    : `${plural(totalTabs, ctx.tabNoun)} · ${detail} · ${plural(ctx.containerCount(), one, many)}`;
+    : [
+      plural(totalTabs - suspended, ctx.tabNoun),
+      suspended > 0 ? `${suspended} suspended` : '',
+      detail,
+      plural(ctx.containerCount(), one, many),
+    ].filter(Boolean).join(' · ');
 }
 
 function renderControls() {
@@ -748,7 +808,7 @@ function renderControls() {
   const busy = isBusy();
   const archived = state.batches.reduce((sum, batch) => sum + batch.tabCount, 0);
   els.archiveCount.textContent = String(archived);
-  els.openCount.textContent = String(state.windows.reduce((sum, win) => sum + win.tabs.length, 0));
+  els.openCount.textContent = String(state.windows.reduce((sum, win) => sum + win.tabs.filter((tab) => !isSuspended(tab)).length, 0));
 
   const count = planArchive(state.windows).count;
   els.archiveAll.hidden = state.source !== 'open';
@@ -761,7 +821,8 @@ function renderControls() {
   els.groupsAdd.disabled = busy;
   els.archiveExport.hidden = state.source !== 'archive';
   els.archiveImport.hidden = state.source !== 'archive';
-  els.archiveExport.disabled = busy || (archived === 0 && state.customGroups.length === 0);
+  const suspended = state.windows.reduce((sum, win) => sum + win.tabs.filter(isSuspended).length, 0);
+  els.archiveExport.disabled = busy || (archived === 0 && state.customGroups.length === 0 && suspended === 0);
   els.archiveImport.disabled = busy;
 
   els.footerHint.textContent = state.source === 'archive'
@@ -776,9 +837,13 @@ const BANNERS = {
     const plan = planArchive(scopeWindows(state.windows, prompt.scope));
     if (plan.count === 0) return null;
     const where = prompt.scope.name ? ` in ${prompt.scope.name}` : '';
+    const suspended = scopeTabs(prompt.scope, isSuspended).length;
     return {
       text: `Archive and close ${plural(plan.count, 'tab')}${where}?`,
-      detail: leftOpenText(plan.skipped, 'stay open'),
+      detail: [
+        suspended > 0 ? `${plural(suspended, 'suspended tab')} ${suspended === 1 ? 'is' : 'are'} included.` : '',
+        leftOpenText(plan.skipped, 'stay open'),
+      ].filter(Boolean).join(' '),
       buttons: [
       { id: 'archive-confirm', label: 'Archive and close', primary: true, onClick: confirmArchive },
         { id: 'archive-cancel', label: 'Cancel', onClick: dismissPrompt },
@@ -801,6 +866,7 @@ const BANNERS = {
 
 const SCOPE_MATCHERS = {
   all: () => () => true,
+  tab: (scope) => (tab) => tab.id === scope.id,
   window: (scope) => (tab, win) => win.id === scope.id,
   group: (scope) => (tab) => tab.groupId === scope.id,
   category: (scope) => (tab) => categorizeTab(tab, state.groupRules).id === scope.id,
@@ -813,7 +879,10 @@ function scopeWindows(windows, scope) {
   return windows.map((win) => ({ ...win, tabs: win.tabs.filter((tab) => includes(tab, win)) }));
 }
 
+const isSuspended = (tab) => tab.suspended === true;
 const archivableCount = (tabs) => tabs.filter((tab) => !skipReason(tab)).length;
+const suspendable = (tab) => !isSuspended(tab) && !skipReason(tab);
+const scopeTabs = (scope, include) => scopeWindows(state.windows, scope).flatMap((win) => win.tabs).filter(include);
 
 function renderBanner() {
   const view = state.prompt && BANNERS[state.prompt.kind](state.prompt);
@@ -1057,7 +1126,8 @@ function restoreFocus(key) {
   if (target && target !== document.activeElement) target.focus({ preventScroll: true });
 }
 
-const emptyBucket = (meta) => ({ meta, tabs: [], archivable: 0, windows: new Set() });
+// tabs are the ones a search matches; all are every tab of the category.
+const emptyBucket = (meta) => ({ meta, tabs: [], all: [], windows: new Set() });
 
 function buildCategories(windows, query) {
   // Without a search, every custom group gets a bucket, so the caller can show
@@ -1071,8 +1141,8 @@ function buildCategories(windows, query) {
       const category = categorizeTab(tab, state.groupRules);
       if (!buckets.has(category.id)) buckets.set(category.id, emptyBucket(category));
       const bucket = buckets.get(category.id);
-      // A section archive takes the whole category, matched by search or not.
-      if (!skipReason(tab)) bucket.archivable += 1;
+      // A section action takes the whole category, matched by search or not.
+      bucket.all.push(tab);
 
       const categoryMatches = category.label.toLowerCase().includes(query);
       if (query && !categoryMatches && !tabMatchesQuery(tab, groupTitles.get(tab.groupId), query)) continue;
@@ -1094,7 +1164,7 @@ function tabMatchesQuery(tab, groupTitle, query) {
     (groupTitle || '').toLowerCase().includes(query);
 }
 
-function renderCategory({ meta, tabs, archivable }, ctx) {
+function renderCategory({ meta, tabs, all }, ctx) {
   const editor = meta.custom && openEditor?.id === meta.groupId ? openEditor : null;
   const section = editor?.section ?? el('section');
   for (const child of [...section.children]) {
@@ -1125,10 +1195,11 @@ function renderCategory({ meta, tabs, archivable }, ctx) {
 
   header.append(chevron, dot, name, count);
   header.addEventListener('click', () => toggleCategory(meta.id));
+  const { reopen, suspend, archive } = sectionActions(ctx,
+    { kind: 'category', id: meta.id, name: meta.label, label: meta.label },
+    all, 'category', `[data-category-id="${CSS.escape(meta.id)}"]`);
   section.prepend(headerRow('categoryId', meta.id, header,
-    meta.custom ? editGroupButton(meta) : null,
-    sectionArchiveButton(ctx, { kind: 'category', id: meta.id, name: meta.label, label: meta.label },
-      archivable, 'category-archive', `[data-category-id="${CSS.escape(meta.id)}"] .category-archive`)));
+    reopen, meta.custom ? editGroupButton(meta) : null, suspend, archive));
   if (editor) updateGroupEditor(editor, state.customGroups[meta.order], meta.order);
 
   if (isCollapsed) return section;
@@ -1170,18 +1241,36 @@ function editGroupButton(meta) {
   return button;
 }
 
-function sectionArchiveButton(ctx, scope, count, className, returnFocus) {
-  if (!ctx.actions.archiveSection || count === 0) return null;
-  const button = document.createElement('button');
-  button.type = 'button';
-  button.className = `section-archive ${className}`;
-  const label = `Archive ${plural(count, 'tab')} in ${scope.name}`;
-  button.title = label;
-  button.setAttribute('aria-label', label);
-  button.disabled = isBusy();
-  button.append(createIcon(ICONS.archive));
-  button.addEventListener('click', () => ctx.actions.archiveSection(scope, returnFocus));
-  return button;
+// The controls beside a section header. Each acts on the whole section, so a
+// search narrows what is shown but not what they take. A control's class is
+// <kind>-<name>, such as group-archive, and focus returns to it afterwards.
+function sectionActions(ctx, scope, tabs, kind, scopeSelector) {
+  const { actions } = ctx;
+  const control = (name, action, count, label, content) => {
+    if (!action || count === 0) return null;
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = `section-${name} ${kind}-${name}`;
+    button.title = label;
+    button.setAttribute('aria-label', label);
+    button.disabled = isBusy();
+    if (content.icon) button.append(createIcon(content.icon));
+    else button.textContent = content.text;
+    button.addEventListener('click', () => action(scope, `${scopeSelector} .${kind}-${name}`));
+    return button;
+  };
+
+  const suspended = tabs.filter(isSuspended).length;
+  const live = tabs.filter(suspendable).length;
+  const archivable = archivableCount(tabs);
+  return {
+    reopen: control('reopen', actions.reopenSection, suspended,
+      `Reopen ${plural(suspended, 'suspended tab')} in ${scope.name}`, { text: `Reopen ${suspended}` }),
+    suspend: control('suspend', actions.suspendSection, live,
+      `Suspend ${plural(live, 'tab')} in ${scope.name}`, { icon: ICONS.suspend }),
+    archive: control('archive', actions.archiveSection, archivable,
+      `Archive ${plural(archivable, 'tab')} in ${scope.name}`, { icon: ICONS.archive }),
+  };
 }
 
 function toggleCategory(categoryId) {
@@ -1213,6 +1302,7 @@ function renderWindow({ win, groups, ungrouped, count }, ctx) {
   const section = el('section', 'window');
   section.dataset.windowId = String(win.id);
   if (win.focused) section.classList.add('is-focused');
+  if (win.id === SUSPENDED_WINDOW_ID) section.classList.add('is-suspended');
 
   const head = el('div', 'window-head');
   const titleWrap = el('div', 'window-title');
@@ -1230,10 +1320,23 @@ function renderWindow({ win, groups, ungrouped, count }, ctx) {
 
   const meta = el('div', 'window-meta');
   const tabCount = el('span', 'window-count');
-  tabCount.textContent = count === win.tabs.length
-    ? plural(count, 'tab')
-    : `${count} of ${plural(win.tabs.length, 'tab')}`;
-  meta.append(tabCount);
+  const suspended = win.tabs.filter((tab) => tab.suspended).length;
+  const open = win.tabs.length - suspended;
+  if (count !== win.tabs.length) {
+    tabCount.textContent = `${count} of ${plural(win.tabs.length, 'tab')}`;
+    meta.append(tabCount);
+  } else {
+    // Matches the summary, which counts open tabs and suspended ones apart.
+    if (open > 0 || suspended === 0) {
+      tabCount.textContent = plural(open, 'tab');
+      meta.append(tabCount);
+    }
+    if (suspended > 0) {
+      const suspendedCount = el('span', 'window-count');
+      suspendedCount.textContent = `${suspended} suspended`;
+      meta.append(suspendedCount);
+    }
+  }
 
   if (groups.length > 0) {
     const groupCount = el('span', 'window-count');
@@ -1241,10 +1344,10 @@ function renderWindow({ win, groups, ungrouped, count }, ctx) {
     meta.append(groupCount);
   }
 
-  const archive = sectionArchiveButton(ctx, {
-    kind: 'window', id: win.id, name: win.focused ? 'the current window' : win.title, label: `Window ${win.number}`,
-  }, archivableCount(win.tabs), 'window-archive', `[data-window-id="${win.id}"] .window-archive`);
-  if (archive) meta.append(archive);
+  const { reopen, suspend, archive } = sectionActions(ctx, {
+    kind: 'window', id: win.id, name: win.focused ? 'the current window' : win.title, label: win.label,
+  }, win.tabs, 'window', `[data-window-id="${CSS.escape(String(win.id))}"]`);
+  meta.append(...[reopen, suspend, archive].filter(Boolean));
 
   head.append(titleWrap, meta);
   section.append(head);
@@ -1287,9 +1390,10 @@ function renderGroup(group, ctx, allTabs) {
   header.append(chevron, dot, name, count);
   header.addEventListener('click', () => toggleGroup(ctx, group.id));
   const groupName = group.title || 'Untitled group';
-  section.append(headerRow('groupId', group.id, header, sectionArchiveButton(ctx,
+  const { reopen, suspend, archive } = sectionActions(ctx,
     { kind: 'group', id: group.id, name: groupName, label: groupName },
-    archivableCount(allTabs), 'group-archive', `[data-group-id="${CSS.escape(String(group.id))}"] .group-archive`)));
+    allTabs, 'group', `[data-group-id="${CSS.escape(String(group.id))}"]`);
+  section.append(headerRow('groupId', group.id, header, reopen, suspend, archive));
 
   if (!isCollapsed) {
     const tabs = el('div', 'group-tabs');
@@ -1322,7 +1426,7 @@ function renderUngrouped(tabs, showLabel, ctx) {
 }
 
 function renderTab(tab, ctx, options = {}) {
-  const { actions } = ctx;
+  const { actions, ageOf } = isSuspended(tab) ? ctx.suspended : ctx;
   const card = el('div', 'tab');
   card.dataset.tabId = String(tab.id);
   if (ctx.source === 'archive') card.dataset.archiveId = tab.id;
@@ -1332,6 +1436,7 @@ function renderTab(tab, ctx, options = {}) {
 
   if (tab.active) card.classList.add('is-active');
   if (tab.discarded) card.classList.add('is-discarded');
+  if (isSuspended(tab)) card.classList.add('is-suspended');
 
   const main = el('div', 'tab-main');
   main.tabIndex = 0;
@@ -1347,6 +1452,7 @@ function renderTab(tab, ctx, options = {}) {
   titleRow.append(title);
 
   const flags = el('span', 'tab-flags');
+  if (isSuspended(tab)) flags.append(createFlag(ICONS.suspend, 'Suspended'));
   if (tab.pinned) flags.append(createFlag(ICONS.pin, 'Pinned'));
   if (tab.audible) {
     const muted = tab.mutedInfo?.muted;
@@ -1355,7 +1461,7 @@ function renderTab(tab, ctx, options = {}) {
   if (flags.childElementCount > 0) titleRow.append(flags);
 
   const urlText = displayUrl(tab.url);
-  const age = ctx.ageOf(tab);
+  const age = ageOf(tab);
 
   text.append(titleRow);
 
@@ -1407,7 +1513,12 @@ function renderTab(tab, ctx, options = {}) {
 
   card.append(main, close);
   const host = groupableHost(tab.url);
-  if (host && EXTENSION_STORAGE) appendTabMenu(card, `${ctx.source}:${tab.id}`, tab.id, host, tab.url);
+  if (host && EXTENSION_STORAGE) {
+    const suspend = ctx.actions.suspendSection && suspendable(tab)
+      ? () => ctx.actions.suspendSection({ kind: 'tab', id: tab.id, name: '', label: '' })
+      : null;
+    appendTabMenu(card, `${ctx.source}:${tab.id}`, tab.id, host, tab.url, suspend);
+  }
   if (actions.middleClick) {
     card.addEventListener('auxclick', (event) => {
       if (event.button === 1) {
@@ -1425,6 +1536,14 @@ function archivedAge(tab) {
     since: tab.archivedAt,
     prefix: 'archived ',
     title: `Archived ${new Date(tab.archivedAt).toLocaleString()}`,
+  };
+}
+
+function suspendedAge(tab) {
+  return {
+    since: tab.suspendedAt,
+    prefix: 'suspended ',
+    title: `Suspended ${new Date(tab.suspendedAt).toLocaleString()}`,
   };
 }
 
@@ -1564,6 +1683,93 @@ async function closeTab(tab) {
   }
 }
 
+// Suspending needs no confirmation: the tabs stay listed and reopen with a
+// click. It runs as busy, so no render shows a tab both open and suspended.
+async function suspendScope(scope, returnFocus = '') {
+  if (isBusy()) return;
+  const tabs = scopeTabs(scope, suspendable);
+  if (tabs.length === 0) return;
+  state.prompt = { kind: 'busy', text: `Suspending ${plural(tabs.length, 'tab')}…` };
+  render();
+
+  let result = null;
+  const focus = [returnFocus];
+  try {
+    const { suspended, leftOpen } = await suspendTabs(tabs, state.windows.flatMap((win) => win.groups));
+    if (suspended.length > 0) focus.push(cardFocus(suspended[0]));
+    if (leftOpen > 0) {
+      result = {
+        kind: 'result',
+        text: `Suspended ${plural(suspended.length, 'tab')}`,
+        detail: `${plural(leftOpen, 'tab')} changed or could not be closed and ${leftOpen === 1 ? 'stays' : 'stay'} open.`,
+        tone: 'warn',
+      };
+    }
+  } catch (error) {
+    console.error('Tab Overview: suspend failed', error);
+    result = { kind: 'result', text: 'Nothing was suspended and no tab was closed', detail: error?.message || '', tone: 'error' };
+  }
+
+  state.prompt = result;
+  await refresh();
+  focusFirst([...(result ? ['#banner-dismiss'] : []), ...focus.filter(Boolean), '#search']);
+}
+
+async function reopenScope(scope, returnFocus = '') {
+  if (isBusy()) return;
+  const tabs = scopeTabs(scope, isSuspended);
+  if (tabs.length === 0) return;
+  state.prompt = { kind: 'busy', text: `Reopening ${plural(tabs.length, 'tab')}…` };
+  render();
+
+  let result = null;
+  const focus = [returnFocus];
+  try {
+    const { opened, failed } = await reopenSuspended(tabs);
+    if (opened.length > 0) focus.push(cardFocus(opened[0]));
+    if (failed > 0) {
+      result = {
+        kind: 'result',
+        text: `Reopened ${plural(opened.length, 'tab')}`,
+        detail: `${plural(failed, 'tab')} could not be opened and ${failed === 1 ? 'stays' : 'stay'} suspended.`,
+        tone: 'warn',
+      };
+    }
+  } catch (error) {
+    console.error('Tab Overview: reopen failed', error);
+    result = { kind: 'result', text: 'Could not reopen the suspended tabs', detail: error?.message || '', tone: 'error' };
+  }
+
+  state.prompt = result;
+  await refresh();
+  focusFirst([...(result ? ['#banner-dismiss'] : []), ...focus.filter(Boolean), '#search']);
+}
+
+async function reopenTab(tab) {
+  if (isBusy()) return;
+  try {
+    const { failed } = await reopenSuspended([tab], { activate: true });
+    if (failed > 0) {
+      state.prompt = { kind: 'result', text: 'Could not reopen the tab', detail: 'It stays suspended.', tone: 'warn' };
+    }
+  } catch (error) {
+    console.warn('Tab Overview: could not reopen suspended tab', error);
+  }
+  scheduleRefresh('open');
+}
+
+async function forgetTab(tab) {
+  if (isBusy()) return;
+  try {
+    await forgetSuspended([tab.id]);
+  } catch (error) {
+    console.warn('Tab Overview: could not forget suspended tab', error);
+  }
+  scheduleRefresh('open');
+}
+
+const cardFocus = (tabId) => `[data-tab-id="${CSS.escape(String(tabId))}"] .tab-main`;
+
 function promptArchive(scope = ALL_TABS, returnFocus = '') {
   if (isBusy()) return;
   if (planArchive(scopeWindows(state.windows, scope)).count === 0) return;
@@ -1581,7 +1787,7 @@ async function confirmArchive() {
   let result;
   try {
     // Re-read so tabs opened or closed since the confirmation are accounted for.
-    const plan = planArchive(scopeWindows(await readOpenWindows(), scope));
+    const plan = planArchive(scopeWindows(await readOpenWindows(await loadSuspended()), scope));
     const { archived, closeFailed, batchId } = await archivePlan(plan, scope.label);
     const notes = [leftOpenText(plan.skipped, 'left open')];
     if (closeFailed > 0) {
@@ -1714,7 +1920,7 @@ async function importArchiveFile(file) {
   if (isBusy()) return;
   let result;
   try {
-    const { batches, tabs, skipped, invalid, groups, groupsSkipped, groupsInvalid } =
+    const { batches, tabs, skipped, invalid, groups, groupsSkipped, groupsInvalid, suspended } =
       await importArchive(await file.text());
     const notes = [];
     if (skipped > 0) notes.push(`${plural(skipped, 'batch', 'batches')} already in the archive were skipped.`);
@@ -1723,7 +1929,12 @@ async function importArchiveFile(file) {
     if (groupsInvalid > 0) notes.push(`${plural(groupsInvalid, 'group')} without a valid id ${groupsInvalid === 1 ? 'was' : 'were'} left out.`);
     result = {
       kind: 'result',
-      text: `Imported ${plural(batches, 'batch', 'batches')}, ${plural(tabs, 'tab')}, ${plural(groups, 'group')}`,
+      text: [
+        `Imported ${plural(batches, 'batch', 'batches')}`,
+        plural(tabs, 'tab'),
+        plural(groups, 'group'),
+        ...(suspended > 0 ? [plural(suspended, 'suspended tab')] : []),
+      ].join(', '),
       detail: notes.join(' '),
       tone: '',
     };
@@ -1778,13 +1989,13 @@ async function changeGroups(change) {
 const groupOf = (host) => state.customGroups.find((group) => group.domains.includes(host));
 const menuButtonSelector = (tabId) => `[data-tab-id="${CSS.escape(String(tabId))}"] .tab-menu-button`;
 
-function appendTabMenu(card, key, tabId, host, url) {
+function appendTabMenu(card, key, tabId, host, url, suspend) {
   const open = state.menu?.key === key;
   const button = document.createElement('button');
   button.type = 'button';
   button.className = 'tab-menu-button';
-  button.title = 'Custom group';
-  button.setAttribute('aria-label', `Put ${host} in a custom group`);
+  button.title = suspend ? 'Group or suspend' : 'Custom group';
+  button.setAttribute('aria-label', suspend ? `Put ${host} in a custom group, or suspend the tab` : `Put ${host} in a custom group`);
   button.setAttribute('aria-haspopup', 'true');
   button.setAttribute('aria-expanded', String(open));
   button.append(createIcon(ICONS.more));
@@ -1793,10 +2004,10 @@ function appendTabMenu(card, key, tabId, host, url) {
 
   if (!open) return;
   card.classList.add('has-menu');
-  card.append(renderTabMenu(host, url));
+  card.append(renderTabMenu(host, url, suspend));
 }
 
-function renderTabMenu(host, url) {
+function renderTabMenu(host, url, suspend) {
   const menu = el('div', 'tab-menu');
   menu.setAttribute('role', 'group');
   menu.setAttribute('aria-label', `Custom group for ${host}`);
@@ -1863,6 +2074,17 @@ function renderTabMenu(host, url) {
     menu.append(el('div', 'tab-menu-divider'));
     menu.append(menuItem(`Remove from ${current.label}`, () => changeGroups(() => unassignDomain(host, current.id))
       .then(() => closeMenu({ focusButton: true })), 'tab-menu-remove'));
+  }
+
+  if (suspend) {
+    menu.append(el('div', 'tab-menu-divider'));
+    const item = menuItem('Suspend tab', () => {
+      closeMenu();
+      suspend();
+    }, 'tab-menu-suspend');
+    item.title = 'Close the tab and keep it here, to reopen later';
+    item.prepend(createIcon(ICONS.suspend));
+    menu.append(item);
   }
 
   return menu;

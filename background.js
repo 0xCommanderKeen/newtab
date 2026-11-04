@@ -1,6 +1,7 @@
 'use strict';
 
 const PREFIX = 'tabOpenedAt:';
+const SUSPENDED_PREFIX = 'suspended:';
 let startupGraceUntil = 0;
 
 /**
@@ -42,6 +43,19 @@ async function syncAllTabs({ forceApproximate = false } = {}) {
   }
 }
 
+// Window ids mean nothing after a restart, and Firefox hands out the same ones
+// again, so a saved id would put a suspended tab in an unrelated window.
+async function clearSuspendedWindows() {
+  const stored = await chrome.storage.local.get(null);
+  const updates = {};
+  for (const [key, value] of Object.entries(stored)) {
+    if (key.startsWith(SUSPENDED_PREFIX) && value?.windowId != null) {
+      updates[key] = { ...value, windowId: null };
+    }
+  }
+  if (Object.keys(updates).length > 0) await chrome.storage.local.set(updates);
+}
+
 async function recordTab(tabId, approximate = false) {
   const key = PREFIX + tabId;
   const stored = await chrome.storage.session.get(key);
@@ -52,8 +66,10 @@ async function recordTab(tabId, approximate = false) {
   });
 }
 
-chrome.runtime.onInstalled.addListener(() => {
+chrome.runtime.onInstalled.addListener(({ reason }) => {
   syncAllTabs().catch(() => {});
+  // A temporary add-on in Firefox is installed anew after every restart.
+  if (reason === 'install') clearSuspendedWindows().catch(() => {});
 });
 
 chrome.runtime.onStartup.addListener(() => {
@@ -62,6 +78,7 @@ chrome.runtime.onStartup.addListener(() => {
   // were opened just now.
   startupGraceUntil = Date.now() + 10_000;
   syncAllTabs({ forceApproximate: true }).catch(() => {});
+  clearSuspendedWindows().catch(() => {});
 });
 
 chrome.tabs.onCreated.addListener((tab) => {
